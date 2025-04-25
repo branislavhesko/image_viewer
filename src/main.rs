@@ -5,7 +5,7 @@ use eframe::icon_data::from_png_bytes;
 
 use image::{DynamicImage, GenericImageView};
 use std::path::PathBuf;
-use image_processing::{min_max_normalize, standardize, log_min_max_normalize};
+use image_processing::{min_max_normalize, standardize, log_min_max_normalize, fft};
 use std::env;
 use log::{info, error};
 
@@ -24,13 +24,16 @@ struct ImageViewerApp {
     last_mouse_pos: Option<egui::Pos2>,
 }
 
+// TODO: FFT is not queite Normalization, but it is a transformation, need to be fixed
 #[derive(PartialEq)]
 enum NormalizationType {
     None,
     MinMax,
     LogMinMax,
     Standard,
+    FFT,
 }
+
 
 impl Default for ImageViewerApp {
     fn default() -> Self {
@@ -71,6 +74,7 @@ impl ImageViewerApp {
                 NormalizationType::MinMax => min_max_normalize(img),
                 NormalizationType::LogMinMax => log_min_max_normalize(img),
                 NormalizationType::Standard => standardize(img),
+                NormalizationType::FFT => fft(img),
             };
 
             let (width, height) = normalized_img.dimensions();
@@ -191,6 +195,8 @@ impl eframe::App for ImageViewerApp {
                 changed |= ui.radio_value(&mut self.normalization, NormalizationType::MinMax, "Min-Max").changed();
                 changed |= ui.radio_value(&mut self.normalization, NormalizationType::LogMinMax, "Log Min-Max").changed();
                 changed |= ui.radio_value(&mut self.normalization, NormalizationType::Standard, "Standard").changed();
+                changed |= ui.radio_value(&mut self.normalization, NormalizationType::FFT, "FFT").changed();
+
 
                 if changed {
                     self.texture = None; // Reset texture when normalization changes
