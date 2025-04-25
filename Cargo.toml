@@ -1,0 +1,22 @@
+[package]
+name = "image_viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.31.1"
+egui = "0.31.1"
+image = "0.25.6"
+rfd = "0.15.3"
+anyhow = "1.0.75"
+log = "0.4.20"
+env_logger = "0.11.8"
+
+[package.metadata.bundle]
+name = "Image Viewer"
+identifier = "com.imageviewer.app"
+icon = ["assets/icon.png"] # Assuming you might have an icon here eventually
+version = "1.0.0"
+short_description = "A simple image viewer."
+long_description = "An image viewer application built with Rust and eframe."
+category = "Graphics and Design"
