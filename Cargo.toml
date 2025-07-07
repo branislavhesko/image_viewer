@@ -13,12 +13,13 @@ strip = true
 [dependencies]
 eframe = "0.31.1"
 egui = "0.31.1"
-image = { version = "0.25.6", features = ["tiff"] }
+image = { version = "0.25.6", features = ["tiff", "webp", "avif", "hdr", "exr", "qoi", "dds", "tga", "pnm", "bmp", "ico", "jpeg", "png", "gif"] }
 rfd = "0.15.3"
 anyhow = "1.0.75"
 log = "0.4.20"
 env_logger = "0.11.8"
 rustfft = "6.0"
+tiff = "0.9"
 
 [package.metadata.bundle]
 name = "Image Viewer"

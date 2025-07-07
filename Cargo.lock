@@ -1824,6 +1824,7 @@ dependencies = [
  "log",
  "rfd",
  "rustfft",
+ "tiff",
 ]
 
 [[package]]

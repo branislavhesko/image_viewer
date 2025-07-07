@@ -3,11 +3,13 @@ mod image_processing;
 use eframe::egui;
 use eframe::icon_data::from_png_bytes;
 
-use image::{DynamicImage, GenericImageView};
+use image::{DynamicImage, GenericImageView, ImageBuffer};
 use std::path::PathBuf;
 use image_processing::{min_max_normalize, standardize, log_min_max_normalize, fft};
 use std::env;
-use log::{info, error};
+use log::{info, error, warn};
+use std::io::BufReader;
+use std::fs::File;
 
 
 const ICON: &[u8] = include_bytes!("../assets/icon.png");
@@ -31,6 +33,8 @@ struct ImageViewerApp {
     pixel_info: Option<(u32, u32, u8, u8, u8)>, // (x, y, r, g, b)
     show_pixel_tool: bool,
     click_pos: Option<egui::Pos2>,
+    is_floating_point_image: bool,
+    original_data_range: Option<(f32, f32)>, // (min, max) of original floating point data
 }
 
 // TODO: FFT is not queite Normalization, but it is a transformation, need to be fixed
@@ -83,6 +87,8 @@ impl Default for ImageViewerApp {
             pixel_info: None,
             show_pixel_tool: false,
             click_pos: None,
+            is_floating_point_image: false,
+            original_data_range: None,
         }
     }
 }
@@ -93,7 +99,7 @@ impl ImageViewerApp {
     }
 
     fn load_image(&mut self, path: PathBuf) -> anyhow::Result<()> {
-        let img = image::open(&path)?;
+        let (img, is_fp, data_range) = self.load_image_with_fallback(&path)?;
         
         // Calculate base scale to fit image in window
         let (img_width, img_height) = img.dimensions();
@@ -105,6 +111,8 @@ impl ImageViewerApp {
         // Store original image without resizing
         self.image = Some(img);
         self.image_path = Some(path);
+        self.is_floating_point_image = is_fp;
+        self.original_data_range = data_range;
         self.offset = egui::Vec2::ZERO;
         self.scale = 1.0; // Reset user scale
         self.texture = None;
@@ -114,6 +122,203 @@ impl ImageViewerApp {
         self.last_normalization = self.normalization;
         self.last_channel = self.channel;
         Ok(())
+    }
+    
+    fn load_image_with_fallback(&self, path: &PathBuf) -> anyhow::Result<(DynamicImage, bool, Option<(f32, f32)>)> {
+        // Try the standard image crate first
+        match image::open(path) {
+            Ok(img) => {
+                info!("Successfully loaded image using standard image crate");
+                return Ok((img, false, None));
+            }
+            Err(e) => {
+                warn!("Standard image loading failed: {}", e);
+                
+                // Check if it's a TIFF file and try direct TIFF loading
+                if let Some(ext) = path.extension() {
+                    if ext.to_string_lossy().to_lowercase() == "tiff" || ext.to_string_lossy().to_lowercase() == "tif" {
+                        info!("Attempting to load TIFF file with direct TIFF decoder");
+                        return self.load_tiff_direct(path);
+                    }
+                }
+                
+                // If not TIFF or TIFF loading failed, return the original error
+                return Err(e.into());
+            }
+        }
+    }
+    
+    fn load_tiff_direct(&self, path: &PathBuf) -> anyhow::Result<(DynamicImage, bool, Option<(f32, f32)>)> {
+        let file = File::open(path)?;
+        let mut decoder = tiff::decoder::Decoder::new(BufReader::new(file))?;
+        
+        // Read the image
+        let (width, height) = decoder.dimensions()?;
+        let colortype = decoder.colortype()?;
+        
+        info!("TIFF dimensions: {}x{}, colortype: {:?}", width, height, colortype);
+        
+        match colortype {
+            tiff::ColorType::Gray(8) => {
+                match decoder.read_image()? {
+                    tiff::decoder::DecodingResult::U8(img_data) => {
+                        let img_buffer = ImageBuffer::from_raw(width, height, img_data)
+                            .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
+                        Ok((DynamicImage::ImageLuma8(img_buffer), false, None))
+                    }
+                    _ => Err(anyhow::anyhow!("Unexpected data type for Gray(8) TIFF")),
+                }
+            }
+            tiff::ColorType::Gray(16) => {
+                match decoder.read_image()? {
+                    tiff::decoder::DecodingResult::U16(img_data) => {
+                        let img_buffer = ImageBuffer::from_raw(width, height, img_data)
+                            .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
+                        Ok((DynamicImage::ImageLuma16(img_buffer), false, None))
+                    }
+                    _ => Err(anyhow::anyhow!("Unexpected data type for Gray(16) TIFF")),
+                }
+            }
+            tiff::ColorType::RGB(8) => {
+                match decoder.read_image()? {
+                    tiff::decoder::DecodingResult::U8(img_data) => {
+                        let img_buffer = ImageBuffer::from_raw(width, height, img_data)
+                            .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
+                        Ok((DynamicImage::ImageRgb8(img_buffer), false, None))
+                    }
+                    _ => Err(anyhow::anyhow!("Unexpected data type for RGB(8) TIFF")),
+                }
+            }
+            tiff::ColorType::RGB(16) => {
+                match decoder.read_image()? {
+                    tiff::decoder::DecodingResult::U16(img_data) => {
+                        let img_buffer = ImageBuffer::from_raw(width, height, img_data)
+                            .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
+                        Ok((DynamicImage::ImageRgb16(img_buffer), false, None))
+                    }
+                    _ => Err(anyhow::anyhow!("Unexpected data type for RGB(16) TIFF")),
+                }
+            }
+            tiff::ColorType::RGBA(8) => {
+                match decoder.read_image()? {
+                    tiff::decoder::DecodingResult::U8(img_data) => {
+                        let img_buffer = ImageBuffer::from_raw(width, height, img_data)
+                            .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
+                        Ok((DynamicImage::ImageRgba8(img_buffer), false, None))
+                    }
+                    _ => Err(anyhow::anyhow!("Unexpected data type for RGBA(8) TIFF")),
+                }
+            }
+            tiff::ColorType::RGBA(16) => {
+                match decoder.read_image()? {
+                    tiff::decoder::DecodingResult::U16(img_data) => {
+                        let img_buffer = ImageBuffer::from_raw(width, height, img_data)
+                            .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
+                        Ok((DynamicImage::ImageRgba16(img_buffer), false, None))
+                    }
+                    _ => Err(anyhow::anyhow!("Unexpected data type for RGBA(16) TIFF")),
+                }
+            }
+            // Handle floating point formats that might not be supported by the image crate
+            tiff::ColorType::Gray(32) => {
+                info!("Loading 32-bit floating point grayscale TIFF");
+                match decoder.read_image()? {
+                    tiff::decoder::DecodingResult::F32(img_data) => {
+                        // Find min/max values for proper normalization
+                        let min_val = img_data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                        let max_val = img_data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                        
+                        info!("TIFF F32 range: {} to {}", min_val, max_val);
+                        
+                        // Convert f32 to u8 for display with proper normalization
+                        let converted_data: Vec<u8> = if (max_val - min_val).abs() > f32::EPSILON {
+                            img_data.iter()
+                                .map(|&val| (((val - min_val) / (max_val - min_val)) * 255.0) as u8)
+                                .collect()
+                        } else {
+                            // If all values are the same, use them directly or set to middle gray
+                            vec![128u8; img_data.len()]
+                        };
+                        
+                        let img_buffer = ImageBuffer::from_raw(width, height, converted_data)
+                            .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
+                        Ok((DynamicImage::ImageLuma8(img_buffer), true, Some((min_val, max_val))))
+                    }
+                    _ => Err(anyhow::anyhow!("Unexpected data type for Gray(32) TIFF")),
+                }
+            }
+            tiff::ColorType::RGB(32) => {
+                info!("Loading 32-bit floating point RGB TIFF");
+                match decoder.read_image()? {
+                    tiff::decoder::DecodingResult::F32(img_data) => {
+                        // Find min/max values for proper normalization
+                        let min_val = img_data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                        let max_val = img_data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                        
+                        info!("TIFF F32 range: {} to {}", min_val, max_val);
+                        
+                        // Convert f32 to u8 for display with proper normalization
+                        let converted_data: Vec<u8> = if (max_val - min_val).abs() > f32::EPSILON {
+                            img_data.iter()
+                                .map(|&val| (((val - min_val) / (max_val - min_val)) * 255.0) as u8)
+                                .collect()
+                        } else {
+                            // If all values are the same, use them directly or set to middle gray
+                            vec![128u8; img_data.len()]
+                        };
+                        
+                        let img_buffer = ImageBuffer::from_raw(width, height, converted_data)
+                            .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
+                        Ok((DynamicImage::ImageRgb8(img_buffer), true, Some((min_val, max_val))))
+                    }
+                    _ => Err(anyhow::anyhow!("Unexpected data type for RGB(32) TIFF")),
+                }
+            }
+            tiff::ColorType::RGBA(32) => {
+                info!("Loading 32-bit floating point RGBA TIFF");
+                match decoder.read_image()? {
+                    tiff::decoder::DecodingResult::F32(img_data) => {
+                        // Find min/max values for proper normalization (excluding alpha channel)
+                        let pixel_count = (width * height) as usize;
+                        let rgb_data = &img_data[..pixel_count * 3]; // Only RGB channels for normalization
+                        
+                        let min_val = rgb_data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                        let max_val = rgb_data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                        
+                        info!("TIFF F32 range: {} to {}", min_val, max_val);
+                        
+                        // Convert f32 to u8 for display with proper normalization
+                        let converted_data: Vec<u8> = if (max_val - min_val).abs() > f32::EPSILON {
+                            img_data.chunks(4)
+                                .flat_map(|pixel| {
+                                    let r = (((pixel[0] - min_val) / (max_val - min_val)) * 255.0) as u8;
+                                    let g = (((pixel[1] - min_val) / (max_val - min_val)) * 255.0) as u8;
+                                    let b = (((pixel[2] - min_val) / (max_val - min_val)) * 255.0) as u8;
+                                    let a = (pixel[3].clamp(0.0, 1.0) * 255.0) as u8; // Alpha stays 0-1
+                                    [r, g, b, a]
+                                })
+                                .collect()
+                        } else {
+                            // If all values are the same, use middle gray
+                            img_data.chunks(4)
+                                .flat_map(|pixel| {
+                                    let a = (pixel[3].clamp(0.0, 1.0) * 255.0) as u8;
+                                    [128u8, 128u8, 128u8, a]
+                                })
+                                .collect()
+                        };
+                        
+                        let img_buffer = ImageBuffer::from_raw(width, height, converted_data)
+                            .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
+                        Ok((DynamicImage::ImageRgba8(img_buffer), true, Some((min_val, max_val))))
+                    }
+                    _ => Err(anyhow::anyhow!("Unexpected data type for RGBA(32) TIFF")),
+                }
+            }
+            _ => {
+                return Err(anyhow::anyhow!("Unsupported TIFF color type: {:?}", colortype));
+            }
+        }
     }
     
     fn calculate_window_size(&self) -> (f32, f32) {
@@ -268,7 +473,7 @@ impl eframe::App for ImageViewerApp {
                 if ui.button("Open Image").clicked() {
                     // Create a file dialog with image filters
                     let file_dialog = rfd::FileDialog::new()
-                        .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "gif"]);
+                        .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "gif", "avif", "hdr", "exr", "farbfeld", "qoi", "dds", "tga", "pnm", "ff", "ico"]);
                     
                     // Try to set a sensible default directory
                     let file_dialog = if let Ok(home_dir) = env::var("HOME") {
@@ -344,6 +549,13 @@ impl eframe::App for ImageViewerApp {
                 if let Some(img) = &self.image {
                     let (width, height) = img.dimensions();
                     ui.label(format!("Size: {}×{}", width, height));
+                    
+                    if self.is_floating_point_image {
+                        ui.label("Type: Floating Point TIFF");
+                        if let Some((min_val, max_val)) = self.original_data_range {
+                            ui.label(format!("Range: {:.3} to {:.3}", min_val, max_val));
+                        }
+                    }
                 }
                 
                 if let Some((x, y, r, g, b)) = self.pixel_info {
