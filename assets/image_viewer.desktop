@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=Image Viewer
+Comment=A simple image viewer built with Rust
+Exec=~/.local/bin/image_viewer %f
+Icon=image_viewer
+Terminal=false
+Type=Application
+Categories=Graphics;Photography;Viewer;Qt;KDE;
+MimeType=image/png;image/jpeg;image/gif;image/bmp;image/tiff;image/webp;image/svg+xml;image/avif;image/heic;image/heif;image/x-icon;image/vnd.microsoft.icon;
+StartupNotify=true
+GenericName=Image Viewer
+Keywords=image;viewer;photo;picture;graphics;
+NoDisplay=false
+X-KDE-StartupNotify=true

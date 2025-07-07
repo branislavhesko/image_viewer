@@ -21,6 +21,9 @@ env_logger = "0.11.8"
 rustfft = "6.0"
 tiff = "0.9"
 
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
 [package.metadata.bundle]
 name = "Image Viewer"
 identifier = "com.imageviewer.app"
