@@ -28,6 +28,9 @@ struct ImageViewerApp {
     last_texture_scale: f32,
     last_normalization: NormalizationType,
     last_channel: ChannelType,
+    pixel_info: Option<(u32, u32, u8, u8, u8)>, // (x, y, r, g, b)
+    show_pixel_tool: bool,
+    click_pos: Option<egui::Pos2>,
 }
 
 // TODO: FFT is not queite Normalization, but it is a transformation, need to be fixed
@@ -77,6 +80,9 @@ impl Default for ImageViewerApp {
             last_texture_scale: 1.0,
             last_normalization: NormalizationType::None,
             last_channel: ChannelType::RGB,
+            pixel_info: None,
+            show_pixel_tool: false,
+            click_pos: None,
         }
     }
 }
@@ -233,7 +239,7 @@ impl eframe::App for ImageViewerApp {
             
             if zoom_delta != 1.0 {
                 let old_scale = self.scale;
-                let new_scale = (self.scale * zoom_delta).clamp(0.1, 5.0);
+                let new_scale = (self.scale * zoom_delta).clamp(0.1, 20.0);
                 
                 if old_scale != new_scale {
                     zoom_info = Some((pointer_pos, old_scale, new_scale));
@@ -241,18 +247,20 @@ impl eframe::App for ImageViewerApp {
             }
         }
 
-        // Handle panning with left mouse button
-        if ctx.input(|i| i.pointer.primary_pressed()) {
-            self.dragging = true;
-        }
-        if !ctx.input(|i| i.pointer.primary_down()) {
-            self.dragging = false;
-        }
-        
-        if self.dragging {
-            let delta = ctx.input(|i| i.pointer.delta());
-            self.offset += delta;
-            ctx.request_repaint();
+        // Handle panning with left mouse button (only when pixel tool is off)
+        if !self.show_pixel_tool {
+            if ctx.input(|i| i.pointer.primary_pressed()) {
+                self.dragging = true;
+            }
+            if !ctx.input(|i| i.pointer.primary_down()) {
+                self.dragging = false;
+            }
+            
+            if self.dragging {
+                let delta = ctx.input(|i| i.pointer.delta());
+                self.offset += delta;
+                ctx.request_repaint();
+            }
         }
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
@@ -289,7 +297,7 @@ impl eframe::App for ImageViewerApp {
                 ui.separator();
 
                 ui.label("Scale:");
-                if ui.add(egui::Slider::new(&mut self.scale, 0.1..=5.0)).changed() {
+                if ui.add(egui::Slider::new(&mut self.scale, 0.1..=20.0)).changed() {
                     self.texture_needs_update = true;
                 }
 
@@ -308,8 +316,10 @@ impl eframe::App for ImageViewerApp {
                     self.texture_needs_update = true;
                 }
                 
-                ui.separator();
-                
+            });
+            
+            // Second line with channel picker and image size information
+            ui.horizontal(|ui| {
                 ui.label("Channel:");
                 let mut channel_changed = false;
                 egui::ComboBox::from_label("")
@@ -323,6 +333,22 @@ impl eframe::App for ImageViewerApp {
                     
                 if channel_changed {
                     self.texture_needs_update = true;
+                }
+                
+                ui.separator();
+                
+                ui.checkbox(&mut self.show_pixel_tool, "Pixel Info");
+                
+                ui.separator();
+                
+                if let Some(img) = &self.image {
+                    let (width, height) = img.dimensions();
+                    ui.label(format!("Size: {}×{}", width, height));
+                }
+                
+                if let Some((x, y, r, g, b)) = self.pixel_info {
+                    ui.separator();
+                    ui.label(format!("Pixel: ({}, {}) RGB({}, {}, {})", x, y, r, g, b));
                 }
             });
         });
@@ -412,11 +438,73 @@ impl eframe::App for ImageViewerApp {
                     
                     let image_rect = egui::Rect::from_min_size(image_pos, display_size);
                     
+                    // Handle pixel tool clicking
+                    if self.show_pixel_tool {
+                        if let Some(pointer_pos) = ui.input(|i| i.pointer.interact_pos()) {
+                            if image_rect.contains(pointer_pos) && ui.input(|i| i.pointer.primary_clicked()) {
+                                // Convert screen coordinates to image coordinates
+                                let relative_pos = pointer_pos - image_rect.min;
+                                let image_x = (relative_pos.x / final_scale) as u32;
+                                let image_y = (relative_pos.y / final_scale) as u32;
+                                
+                                // Sample pixel from original image
+                                if image_x < orig_width && image_y < orig_height {
+                                    let pixel = img.get_pixel(image_x, image_y);
+                                    let rgba = pixel.0;
+                                    self.pixel_info = Some((image_x, image_y, rgba[0], rgba[1], rgba[2]));
+                                    self.click_pos = Some(pointer_pos);
+                                }
+                            }
+                        }
+                    }
+                    
                     // Only draw the image if it intersects with the visible area
                     if image_rect.intersects(available_rect) {
                         let image = egui::Image::new(texture)
                             .fit_to_exact_size(display_size);
                         ui.put(image_rect, image);
+                    }
+                    
+                    // Display click information near cursor (after image to render on top)
+                    if let (Some((x, y, r, g, b)), Some(click_pos)) = (self.pixel_info, self.click_pos) {
+                        let text_pos = egui::pos2(click_pos.x + 2.0, click_pos.y - 20.0);
+                        let text_content = format!("({}, {}) RGB({}, {}, {})", x, y, r, g, b);
+                        
+                        // Create a background for the text
+                        let text_galley = ui.painter().layout_no_wrap(
+                            text_content.clone(),
+                            egui::FontId::proportional(12.0),
+                            egui::Color32::WHITE,
+                        );
+                        
+                        let text_rect = egui::Rect::from_min_size(
+                            text_pos,
+                            text_galley.size() + egui::vec2(8.0, 4.0),
+                        );
+                        
+                        // Draw background
+                        ui.painter().rect_filled(
+                            text_rect,
+                            egui::Rounding::same(3),
+                            egui::Color32::from_black_alpha(200),
+                        );
+                        
+                        // Draw border
+                        ui.painter().rect_stroke(
+                            text_rect,
+                            egui::Rounding::same(3),
+                            egui::Stroke::new(1.0, egui::Color32::GRAY),
+                            egui::StrokeKind::Outside,
+                        );
+                        
+                        // Draw text
+                        ui.painter().text(
+                            text_pos + egui::vec2(4.0, 2.0),
+                            egui::Align2::LEFT_TOP,
+                            text_content,
+                            egui::FontId::proportional(12.0),
+                            egui::Color32::WHITE,
+                        );
                     }
                 } else {
                     ui.centered_and_justified(|ui| {
