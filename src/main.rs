@@ -469,6 +469,7 @@ impl eframe::App for ImageViewerApp {
         }
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            // First row: Open button, filename, and Scale
             ui.horizontal(|ui| {
                 if ui.button("Open Image").clicked() {
                     // Create a file dialog with image filters
@@ -501,13 +502,22 @@ impl eframe::App for ImageViewerApp {
 
                 ui.separator();
 
+                // Show filename of currently loaded image
+                if let Some(path) = &self.image_path {
+                    if let Some(filename) = path.file_name() {
+                        ui.label(format!("File: {}", filename.to_string_lossy()));
+                        ui.separator();
+                    }
+                }
+
                 ui.label("Scale:");
                 if ui.add(egui::Slider::new(&mut self.scale, 0.1..=20.0)).changed() {
                     self.texture_needs_update = true;
                 }
-
-                ui.separator();
-
+            });
+            
+            // Second row: Normalization
+            ui.horizontal(|ui| {
                 ui.label("Normalization:");
                 let mut changed = false;
                 changed |= ui.radio_value(&mut self.normalization, NormalizationType::None, "None").changed();
@@ -516,14 +526,12 @@ impl eframe::App for ImageViewerApp {
                 changed |= ui.radio_value(&mut self.normalization, NormalizationType::Standard, "Standard").changed();
                 changed |= ui.radio_value(&mut self.normalization, NormalizationType::FFT, "FFT").changed();
 
-
                 if changed {
                     self.texture_needs_update = true;
                 }
-                
             });
             
-            // Second line with channel picker and image size information
+            // Third row: Channel, Pixel Info, and image information
             ui.horizontal(|ui| {
                 ui.label("Channel:");
                 let mut channel_changed = false;
