@@ -18,5 +18,8 @@ fn main() {
         let mut res = winres::WindowsResource::new();
         res.set_icon("assets/icon.ico");
         res.compile().unwrap();
+        
+        // Set Windows subsystem to hide console window
+        println!("cargo:rustc-link-arg-bins=/SUBSYSTEM:WINDOWS");
     }
 }
