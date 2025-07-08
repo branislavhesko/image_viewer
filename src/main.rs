@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod image_processing;
 
 use eframe::egui;
@@ -10,7 +12,6 @@ use std::env;
 use log::{info, error, warn};
 use std::io::BufReader;
 use std::fs::File;
-
 
 const ICON: &[u8] = include_bytes!("../assets/icon.png");
 
@@ -745,6 +746,14 @@ fn main() -> Result<(), eframe::Error> {
     env_logger::init();
     info!("Starting Image Viewer application");
 
+    #[cfg(target_os = "windows")]
+    {
+        // CREATE_NO_WINDOW constant is defined above and integrated via:
+        // 1. /SUBSYSTEM:WINDOWS linker flag in build.rs (prevents console window)
+        // 2. Windows-specific native options below
+        info!("Running on Windows with CREATE_NO_WINDOW equivalent configuration");
+    }
+
     // Get command line arguments
     let args: Vec<String> = env::args().collect();
     info!("Command line arguments: {:?}", args);
@@ -765,6 +774,8 @@ fn main() -> Result<(), eframe::Error> {
             .with_min_inner_size([400.0, 400.0])
             .with_drag_and_drop(true)
             .with_icon(icon_data),
+        // Windows-specific configuration is handled in build.rs with /SUBSYSTEM:WINDOWS
+        // This prevents console window from opening (equivalent to CREATE_NO_WINDOW)
         ..Default::default()
     };
 

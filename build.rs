@@ -20,6 +20,7 @@ fn main() {
         res.compile().unwrap();
         
         // Set Windows subsystem to hide console window
+        // This is equivalent to CREATE_NO_WINDOW flag - prevents terminal from opening
         println!("cargo:rustc-link-arg-bins=/SUBSYSTEM:WINDOWS");
     }
 }
