@@ -32,10 +32,15 @@ struct ImageViewerApp {
     last_normalization: NormalizationType,
     last_channel: ChannelType,
     pixel_info: Option<(u32, u32, u8, u8, u8)>, // (x, y, r, g, b)
+    pixel_info_fp: Option<(u32, u32, f32, f32, f32)>, // (x, y, r, g, b) for floating point images
+    pixel_info_channels: Option<u32>, // Number of channels for current pixel info
     show_pixel_tool: bool,
     click_pos: Option<egui::Pos2>,
     is_floating_point_image: bool,
     original_data_range: Option<(f32, f32)>, // (min, max) of original floating point data
+    original_fp_data: Option<Vec<f32>>, // Store original floating point pixel data
+    original_fp_dimensions: Option<(u32, u32)>, // Width, height of original FP data
+    original_fp_channels: Option<u32>, // Number of channels (1 for Gray, 3 for RGB)
 }
 
 // TODO: FFT is not queite Normalization, but it is a transformation, need to be fixed
@@ -86,10 +91,15 @@ impl Default for ImageViewerApp {
             last_normalization: NormalizationType::None,
             last_channel: ChannelType::RGB,
             pixel_info: None,
+            pixel_info_fp: None,
+            pixel_info_channels: None,
             show_pixel_tool: false,
             click_pos: None,
             is_floating_point_image: false,
             original_data_range: None,
+            original_fp_data: None,
+            original_fp_dimensions: None,
+            original_fp_channels: None,
         }
     }
 }
@@ -100,7 +110,7 @@ impl ImageViewerApp {
     }
 
     fn load_image(&mut self, path: PathBuf) -> anyhow::Result<()> {
-        let (img, is_fp, data_range) = self.load_image_with_fallback(&path)?;
+        let (img, is_fp, data_range, fp_data, fp_dims, fp_channels) = self.load_image_with_fallback(&path)?;
         
         // Calculate base scale to fit image in window
         let (img_width, img_height) = img.dimensions();
@@ -114,6 +124,10 @@ impl ImageViewerApp {
         self.image_path = Some(path);
         self.is_floating_point_image = is_fp;
         self.original_data_range = data_range;
+        // Store floating point data if available
+        self.original_fp_data = fp_data;
+        self.original_fp_dimensions = fp_dims;
+        self.original_fp_channels = fp_channels;
         self.offset = egui::Vec2::ZERO;
         self.scale = 1.0; // Reset user scale
         self.texture = None;
@@ -125,12 +139,12 @@ impl ImageViewerApp {
         Ok(())
     }
     
-    fn load_image_with_fallback(&self, path: &PathBuf) -> anyhow::Result<(DynamicImage, bool, Option<(f32, f32)>)> {
+    fn load_image_with_fallback(&self, path: &PathBuf) -> anyhow::Result<(DynamicImage, bool, Option<(f32, f32)>, Option<Vec<f32>>, Option<(u32, u32)>, Option<u32>)> {
         // Try the standard image crate first
         match image::open(path) {
             Ok(img) => {
                 info!("Successfully loaded image using standard image crate");
-                return Ok((img, false, None));
+                return Ok((img, false, None, None, None, None));
             }
             Err(e) => {
                 warn!("Standard image loading failed: {}", e);
@@ -149,7 +163,7 @@ impl ImageViewerApp {
         }
     }
     
-    fn load_tiff_direct(&self, path: &PathBuf) -> anyhow::Result<(DynamicImage, bool, Option<(f32, f32)>)> {
+    fn load_tiff_direct(&self, path: &PathBuf) -> anyhow::Result<(DynamicImage, bool, Option<(f32, f32)>, Option<Vec<f32>>, Option<(u32, u32)>, Option<u32>)> {
         let file = File::open(path)?;
         let mut decoder = tiff::decoder::Decoder::new(BufReader::new(file))?;
         
@@ -165,7 +179,7 @@ impl ImageViewerApp {
                     tiff::decoder::DecodingResult::U8(img_data) => {
                         let img_buffer = ImageBuffer::from_raw(width, height, img_data)
                             .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
-                        Ok((DynamicImage::ImageLuma8(img_buffer), false, None))
+                        Ok((DynamicImage::ImageLuma8(img_buffer), false, None, None, None, None))
                     }
                     _ => Err(anyhow::anyhow!("Unexpected data type for Gray(8) TIFF")),
                 }
@@ -175,7 +189,7 @@ impl ImageViewerApp {
                     tiff::decoder::DecodingResult::U16(img_data) => {
                         let img_buffer = ImageBuffer::from_raw(width, height, img_data)
                             .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
-                        Ok((DynamicImage::ImageLuma16(img_buffer), false, None))
+                        Ok((DynamicImage::ImageLuma16(img_buffer), false, None, None, None, None))
                     }
                     _ => Err(anyhow::anyhow!("Unexpected data type for Gray(16) TIFF")),
                 }
@@ -185,7 +199,7 @@ impl ImageViewerApp {
                     tiff::decoder::DecodingResult::U8(img_data) => {
                         let img_buffer = ImageBuffer::from_raw(width, height, img_data)
                             .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
-                        Ok((DynamicImage::ImageRgb8(img_buffer), false, None))
+                        Ok((DynamicImage::ImageRgb8(img_buffer), false, None, None, None, None))
                     }
                     _ => Err(anyhow::anyhow!("Unexpected data type for RGB(8) TIFF")),
                 }
@@ -195,7 +209,7 @@ impl ImageViewerApp {
                     tiff::decoder::DecodingResult::U16(img_data) => {
                         let img_buffer = ImageBuffer::from_raw(width, height, img_data)
                             .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
-                        Ok((DynamicImage::ImageRgb16(img_buffer), false, None))
+                        Ok((DynamicImage::ImageRgb16(img_buffer), false, None, None, None, None))
                     }
                     _ => Err(anyhow::anyhow!("Unexpected data type for RGB(16) TIFF")),
                 }
@@ -205,7 +219,7 @@ impl ImageViewerApp {
                     tiff::decoder::DecodingResult::U8(img_data) => {
                         let img_buffer = ImageBuffer::from_raw(width, height, img_data)
                             .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
-                        Ok((DynamicImage::ImageRgba8(img_buffer), false, None))
+                        Ok((DynamicImage::ImageRgba8(img_buffer), false, None, None, None, None))
                     }
                     _ => Err(anyhow::anyhow!("Unexpected data type for RGBA(8) TIFF")),
                 }
@@ -215,7 +229,7 @@ impl ImageViewerApp {
                     tiff::decoder::DecodingResult::U16(img_data) => {
                         let img_buffer = ImageBuffer::from_raw(width, height, img_data)
                             .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
-                        Ok((DynamicImage::ImageRgba16(img_buffer), false, None))
+                        Ok((DynamicImage::ImageRgba16(img_buffer), false, None, None, None, None))
                     }
                     _ => Err(anyhow::anyhow!("Unexpected data type for RGBA(16) TIFF")),
                 }
@@ -243,7 +257,7 @@ impl ImageViewerApp {
                         
                         let img_buffer = ImageBuffer::from_raw(width, height, converted_data)
                             .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
-                        Ok((DynamicImage::ImageLuma8(img_buffer), true, Some((min_val, max_val))))
+                        Ok((DynamicImage::ImageLuma8(img_buffer), true, Some((min_val, max_val)), Some(img_data), Some((width, height)), Some(1)))
                     }
                     _ => Err(anyhow::anyhow!("Unexpected data type for Gray(32) TIFF")),
                 }
@@ -270,7 +284,7 @@ impl ImageViewerApp {
                         
                         let img_buffer = ImageBuffer::from_raw(width, height, converted_data)
                             .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
-                        Ok((DynamicImage::ImageRgb8(img_buffer), true, Some((min_val, max_val))))
+                        Ok((DynamicImage::ImageRgb8(img_buffer), true, Some((min_val, max_val)), Some(img_data), Some((width, height)), Some(3)))
                     }
                     _ => Err(anyhow::anyhow!("Unexpected data type for RGB(32) TIFF")),
                 }
@@ -311,7 +325,7 @@ impl ImageViewerApp {
                         
                         let img_buffer = ImageBuffer::from_raw(width, height, converted_data)
                             .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from TIFF data"))?;
-                        Ok((DynamicImage::ImageRgba8(img_buffer), true, Some((min_val, max_val))))
+                        Ok((DynamicImage::ImageRgba8(img_buffer), true, Some((min_val, max_val)), Some(img_data), Some((width, height)), Some(4)))
                     }
                     _ => Err(anyhow::anyhow!("Unexpected data type for RGBA(32) TIFF")),
                 }
@@ -670,9 +684,70 @@ impl eframe::App for ImageViewerApp {
                                 
                                 // Sample pixel from original image
                                 if image_x < orig_width && image_y < orig_height {
-                                    let pixel = img.get_pixel(image_x, image_y);
-                                    let rgba = pixel.0;
-                                    self.pixel_info = Some((image_x, image_y, rgba[0], rgba[1], rgba[2]));
+                                    // Check if we have original floating point data
+                                    if let (Some(fp_data), Some((fp_width, fp_height)), Some(fp_channels)) = (
+                                        &self.original_fp_data,
+                                        self.original_fp_dimensions,
+                                        self.original_fp_channels
+                                    ) {
+                                        // Sample from original floating point data
+                                        let pixel_idx = (image_y * fp_width + image_x) as usize;
+                                        match fp_channels {
+                                            1 => {
+                                                // Grayscale
+                                                if pixel_idx < fp_data.len() {
+                                                    let gray = fp_data[pixel_idx];
+                                                    self.pixel_info_fp = Some((image_x, image_y, gray, gray, gray));
+                                                    self.pixel_info_channels = Some(1);
+                                                }
+                                            }
+                                            3 => {
+                                                // RGB
+                                                let base_idx = pixel_idx * 3;
+                                                if base_idx + 2 < fp_data.len() {
+                                                    let r = fp_data[base_idx];
+                                                    let g = fp_data[base_idx + 1];
+                                                    let b = fp_data[base_idx + 2];
+                                                    self.pixel_info_fp = Some((image_x, image_y, r, g, b));
+                                                    self.pixel_info_channels = Some(3);
+                                                }
+                                            }
+                                            4 => {
+                                                // RGBA - use RGB channels
+                                                let base_idx = pixel_idx * 4;
+                                                if base_idx + 2 < fp_data.len() {
+                                                    let r = fp_data[base_idx];
+                                                    let g = fp_data[base_idx + 1];
+                                                    let b = fp_data[base_idx + 2];
+                                                    self.pixel_info_fp = Some((image_x, image_y, r, g, b));
+                                                    self.pixel_info_channels = Some(4);
+                                                }
+                                            }
+                                            _ => {
+                                                // Fallback to normalized values
+                                                let pixel = img.get_pixel(image_x, image_y);
+                                                let rgba = pixel.0;
+                                                self.pixel_info = Some((image_x, image_y, rgba[0], rgba[1], rgba[2]));
+                                                self.pixel_info_fp = None;
+                                                self.pixel_info_channels = None;
+                                            }
+                                        }
+                                    } else {
+                                        // Use normalized values for non-floating point images
+                                        let pixel = img.get_pixel(image_x, image_y);
+                                        let rgba = pixel.0;
+                                        self.pixel_info = Some((image_x, image_y, rgba[0], rgba[1], rgba[2]));
+                                        self.pixel_info_fp = None;
+                                        
+                                        // Determine channel count based on image type
+                                        use image::DynamicImage;
+                                        self.pixel_info_channels = Some(match img {
+                                            DynamicImage::ImageLuma8(_) | DynamicImage::ImageLuma16(_) => 1,
+                                            DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgb16(_) => 3,
+                                            DynamicImage::ImageRgba8(_) | DynamicImage::ImageRgba16(_) => 4,
+                                            _ => 3, // Default to RGB for other types
+                                        });
+                                    }
                                     self.click_pos = Some(pointer_pos);
                                 }
                             }
@@ -687,9 +762,25 @@ impl eframe::App for ImageViewerApp {
                     }
                     
                     // Display click information near cursor (after image to render on top)
-                    if let (Some((x, y, r, g, b)), Some(click_pos)) = (self.pixel_info, self.click_pos) {
+                    if let Some(click_pos) = self.click_pos {
                         let text_pos = egui::pos2(click_pos.x + 2.0, click_pos.y - 20.0);
-                        let text_content = format!("({}, {}) RGB({}, {}, {})", x, y, r, g, b);
+                        let text_content = if let Some((x, y, r, g, b)) = self.pixel_info_fp {
+                            // Show original floating point values
+                            match self.pixel_info_channels {
+                                Some(1) => format!("({}, {}) Gray({:.4})", x, y, r),
+                                _ => format!("({}, {}) RGB({:.4}, {:.4}, {:.4})", x, y, r, g, b),
+                            }
+                        } else if let Some((x, y, r, g, b)) = self.pixel_info {
+                            // Show normalized u8 values
+                            match self.pixel_info_channels {
+                                Some(1) => format!("({}, {}) Gray({})", x, y, r),
+                                _ => format!("({}, {}) RGB({}, {}, {})", x, y, r, g, b),
+                            }
+                        } else {
+                            String::new()
+                        };
+                        
+                        if !text_content.is_empty() {
                         
                         // Create a background for the text
                         let text_galley = ui.painter().layout_no_wrap(
@@ -726,6 +817,7 @@ impl eframe::App for ImageViewerApp {
                             egui::FontId::proportional(12.0),
                             egui::Color32::WHITE,
                         );
+                        }
                     }
                 } else {
                     ui.centered_and_justified(|ui| {
