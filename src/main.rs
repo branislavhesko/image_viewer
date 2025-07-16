@@ -12,9 +12,16 @@ use std::env;
 use log::{info, error, warn};
 use std::io::BufReader;
 use std::fs::File;
+use std::sync::{Arc, Mutex};
 
 const ICON: &[u8] = include_bytes!("../assets/icon.png");
 
+#[derive(Default, Clone)]
+struct HistogramData {
+    histograms: Option<Vec<Vec<u32>>>,
+    hover_info: Option<(u32, u32, f32)>,
+    hover_pos: Option<egui::Pos2>,
+}
 
 struct ImageViewerApp {
     image: Option<DynamicImage>,
@@ -44,8 +51,8 @@ struct ImageViewerApp {
     show_histogram: bool, // Whether histogram window is open
     histogram_data: Option<Vec<Vec<u32>>>, // Histogram data for each channel (RGB)
     histogram_needs_update: bool, // Whether histogram needs recalculation
-    histogram_hover_info: Option<(u32, u32, f32)>, // (bin, count, percentage) for histogram hover
-    histogram_hover_pos: Option<egui::Pos2>, // Position for histogram hover display
+    histogram_shared_data: Arc<Mutex<HistogramData>>, // Shared data for histogram window
+    histogram_window_id: Option<egui::ViewportId>, // ID of the histogram window
 }
 
 // TODO: FFT is not queite Normalization, but it is a transformation, need to be fixed
@@ -108,8 +115,8 @@ impl Default for ImageViewerApp {
             show_histogram: false,
             histogram_data: None,
             histogram_needs_update: false,
-            histogram_hover_info: None,
-            histogram_hover_pos: None,
+            histogram_shared_data: Arc::new(Mutex::new(HistogramData::default())),
+            histogram_window_id: None,
         }
     }
 }
@@ -367,6 +374,467 @@ impl ImageViewerApp {
         }
     }
     
+    fn render_histogram_in_viewport(
+        ui: &mut egui::Ui, 
+        histograms: &[Vec<u32>], 
+        histogram_hover_info: &mut Option<(u32, u32, f32)>,
+        histogram_hover_pos: &mut Option<egui::Pos2>
+    ) {
+        let available_size = ui.available_size();
+        let plot_size = egui::vec2(available_size.x, available_size.y - 40.0);
+        
+        ui.allocate_ui(plot_size, |ui| {
+            let rect = ui.available_rect_before_wrap();
+            
+            // Handle mouse hover for histogram info
+            if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                if rect.contains(hover_pos) {
+                    // Calculate which bin we're hovering over
+                    let relative_x = hover_pos.x - rect.min.x;
+                    let bin = ((relative_x / rect.width()) * 256.0) as usize;
+                    
+                    if bin < 256 {
+                        // Get counts for all channels
+                        let red_count = histograms[0][bin];
+                        let green_count = histograms[1][bin];
+                        let blue_count = histograms[2][bin];
+                        
+                        // For grayscale images (where R=G=B), just use one count
+                        let display_count = if red_count == green_count && green_count == blue_count {
+                            red_count
+                        } else {
+                            red_count.max(green_count).max(blue_count)
+                        };
+                        
+                        // Calculate total pixels for percentage
+                        let total_pixels: u32 = histograms[0].iter().sum();
+                        let percentage = if total_pixels > 0 {
+                            (display_count as f32 / total_pixels as f32) * 100.0
+                        } else {
+                            0.0
+                        };
+                        
+                        *histogram_hover_info = Some((bin as u32, display_count, percentage));
+                        *histogram_hover_pos = Some(hover_pos);
+                    }
+                } else {
+                    *histogram_hover_info = None;
+                    *histogram_hover_pos = None;
+                }
+            } else {
+                *histogram_hover_info = None;
+                *histogram_hover_pos = None;
+            }
+            
+            // Find max value for scaling
+            let max_value = histograms.iter()
+                .flat_map(|h| h.iter())
+                .cloned()
+                .max()
+                .unwrap_or(1) as f32;
+            
+            // Draw histogram bars
+            let bar_width = rect.width() / 256.0;
+            let colors = [
+                egui::Color32::from_rgb(255, 80, 80),   // Red
+                egui::Color32::from_rgb(80, 255, 80),   // Green
+                egui::Color32::from_rgb(80, 80, 255),   // Blue
+            ];
+            
+            // Draw background
+            ui.painter().rect_filled(
+                rect,
+                egui::Rounding::same(2),
+                egui::Color32::from_gray(15),
+            );
+            
+            // Draw grid lines
+            let grid_color = egui::Color32::from_gray(40);
+            // Vertical grid lines (every 32 values)
+            for i in (0..=256).step_by(32) {
+                let x = rect.min.x + (i as f32 / 256.0) * rect.width();
+                ui.painter().line_segment(
+                    [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+                    egui::Stroke::new(1.0, grid_color),
+                );
+            }
+            // Horizontal grid lines
+            for i in 0..5 {
+                let y = rect.min.y + (i as f32 / 4.0) * rect.height();
+                ui.painter().line_segment(
+                    [egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)],
+                    egui::Stroke::new(1.0, grid_color),
+                );
+            }
+            
+            // Draw histogram for each channel
+            for (channel, histogram) in histograms.iter().enumerate() {
+                let color = colors[channel];
+                
+                for (bin, &count) in histogram.iter().enumerate() {
+                    if count > 0 {
+                        let height = (count as f32 / max_value) * rect.height();
+                        let x = rect.min.x + bin as f32 * bar_width;
+                        let y = rect.max.y - height;
+                        
+                        let bar_rect = egui::Rect::from_min_size(
+                            egui::pos2(x, y),
+                            egui::vec2(bar_width.max(1.0), height),
+                        );
+                        
+                        ui.painter().rect_filled(
+                            bar_rect,
+                            egui::Rounding::ZERO,
+                            egui::Color32::from_rgba_unmultiplied(
+                                color.r(),
+                                color.g(),
+                                color.b(),
+                                150, // More opaque
+                            ),
+                        );
+                    }
+                }
+            }
+            
+            // Draw border
+            ui.painter().rect_stroke(
+                rect,
+                egui::Rounding::same(2),
+                egui::Stroke::new(1.0, egui::Color32::GRAY),
+                egui::StrokeKind::Outside,
+            );
+            
+            // Draw axis labels
+            ui.painter().text(
+                rect.min + egui::vec2(5.0, 5.0),
+                egui::Align2::LEFT_TOP,
+                format!("Histogram (Max: {})", max_value as u32),
+                egui::FontId::proportional(14.0),
+                egui::Color32::WHITE,
+            );
+            
+            // X-axis labels (pixel values)
+            for i in (0..=256).step_by(32) {
+                let x = rect.min.x + (i as f32 / 256.0) * rect.width();
+                ui.painter().text(
+                    egui::pos2(x, rect.max.y + 5.0),
+                    egui::Align2::CENTER_TOP,
+                    i.to_string(),
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::LIGHT_GRAY,
+                );
+            }
+            
+            // Y-axis labels (count values)
+            for i in 0..5 {
+                let y = rect.max.y - (i as f32 / 4.0) * rect.height();
+                let count = (max_value * i as f32 / 4.0) as u32;
+                ui.painter().text(
+                    egui::pos2(rect.min.x - 5.0, y),
+                    egui::Align2::RIGHT_CENTER,
+                    count.to_string(),
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::LIGHT_GRAY,
+                );
+            }
+            
+            // Display hover information similar to pixel info
+            if let (Some((bin, count, percentage)), Some(hover_pos)) = (*histogram_hover_info, *histogram_hover_pos) {
+                let text_pos = egui::pos2(hover_pos.x + 15.0, hover_pos.y - 50.0);
+                
+                // Show detailed information for each channel
+                let red_count = histograms[0][bin as usize];
+                let green_count = histograms[1][bin as usize];
+                let blue_count = histograms[2][bin as usize];
+                
+                let text_content = if red_count == green_count && green_count == blue_count {
+                    // Grayscale image
+                    format!("Value: {}\nCount: {} ({:.2}%)", bin, count, percentage)
+                } else {
+                    // Color image - show all channels
+                    format!("Value: {}\nRed: {}\nGreen: {}\nBlue: {}\nTotal: {:.2}%", 
+                           bin, red_count, green_count, blue_count, percentage)
+                };
+                
+                // Create a background for the text
+                let text_galley = ui.painter().layout(
+                    text_content.clone(),
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::WHITE,
+                    200.0, // Max width for text wrapping
+                );
+                
+                let text_rect = egui::Rect::from_min_size(
+                    text_pos,
+                    text_galley.size() + egui::vec2(12.0, 8.0),
+                );
+                
+                // Draw background
+                ui.painter().rect_filled(
+                    text_rect,
+                    egui::Rounding::same(4),
+                    egui::Color32::from_black_alpha(220),
+                );
+                
+                // Draw border
+                ui.painter().rect_stroke(
+                    text_rect,
+                    egui::Rounding::same(4),
+                    egui::Stroke::new(1.5, egui::Color32::LIGHT_GRAY),
+                    egui::StrokeKind::Outside,
+                );
+                
+                // Draw text
+                ui.painter().galley(
+                    text_pos + egui::vec2(6.0, 4.0),
+                    text_galley,
+                    egui::Color32::WHITE,
+                );
+            }
+        });
+        
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Channels: ");
+            ui.colored_label(egui::Color32::from_rgb(255, 80, 80), "■ Red");
+            ui.colored_label(egui::Color32::from_rgb(80, 255, 80), "■ Green");
+            ui.colored_label(egui::Color32::from_rgb(80, 80, 255), "■ Blue");
+            ui.separator();
+            ui.label("Hover over histogram to see detailed values");
+        });
+    }
+
+    fn render_histogram_static(
+        ui: &mut egui::Ui, 
+        histograms: &[Vec<u32>], 
+        histogram_hover_info: &mut Option<(u32, u32, f32)>,
+        histogram_hover_pos: &mut Option<egui::Pos2>
+    ) {
+        let available_size = ui.available_size();
+        let plot_size = egui::vec2(available_size.x, available_size.y - 40.0);
+        
+        ui.allocate_ui(plot_size, |ui| {
+            let rect = ui.available_rect_before_wrap();
+            
+            // Handle mouse hover for histogram info
+            if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                if rect.contains(hover_pos) {
+                    // Calculate which bin we're hovering over
+                    let relative_x = hover_pos.x - rect.min.x;
+                    let bin = ((relative_x / rect.width()) * 256.0) as usize;
+                    
+                    if bin < 256 {
+                        // Get counts for all channels
+                        let red_count = histograms[0][bin];
+                        let green_count = histograms[1][bin];
+                        let blue_count = histograms[2][bin];
+                        
+                        // For grayscale images (where R=G=B), just use one count
+                        let display_count = if red_count == green_count && green_count == blue_count {
+                            red_count
+                        } else {
+                            red_count.max(green_count).max(blue_count)
+                        };
+                        
+                        // Calculate total pixels for percentage
+                        let total_pixels: u32 = histograms[0].iter().sum();
+                        let percentage = if total_pixels > 0 {
+                            (display_count as f32 / total_pixels as f32) * 100.0
+                        } else {
+                            0.0
+                        };
+                        
+                        *histogram_hover_info = Some((bin as u32, display_count, percentage));
+                        *histogram_hover_pos = Some(hover_pos);
+                    }
+                } else {
+                    *histogram_hover_info = None;
+                    *histogram_hover_pos = None;
+                }
+            } else {
+                *histogram_hover_info = None;
+                *histogram_hover_pos = None;
+            }
+            
+            // Find max value for scaling
+            let max_value = histograms.iter()
+                .flat_map(|h| h.iter())
+                .cloned()
+                .max()
+                .unwrap_or(1) as f32;
+            
+            // Draw histogram bars
+            let bar_width = rect.width() / 256.0;
+            let colors = [
+                egui::Color32::from_rgb(255, 80, 80),   // Red
+                egui::Color32::from_rgb(80, 255, 80),   // Green
+                egui::Color32::from_rgb(80, 80, 255),   // Blue
+            ];
+            
+            // Draw background
+            ui.painter().rect_filled(
+                rect,
+                egui::Rounding::same(2),
+                egui::Color32::from_gray(15),
+            );
+            
+            // Draw grid lines
+            let grid_color = egui::Color32::from_gray(40);
+            // Vertical grid lines (every 32 values)
+            for i in (0..=256).step_by(32) {
+                let x = rect.min.x + (i as f32 / 256.0) * rect.width();
+                ui.painter().line_segment(
+                    [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+                    egui::Stroke::new(1.0, grid_color),
+                );
+            }
+            // Horizontal grid lines
+            for i in 0..5 {
+                let y = rect.min.y + (i as f32 / 4.0) * rect.height();
+                ui.painter().line_segment(
+                    [egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)],
+                    egui::Stroke::new(1.0, grid_color),
+                );
+            }
+            
+            // Draw histogram for each channel
+            for (channel, histogram) in histograms.iter().enumerate() {
+                let color = colors[channel];
+                
+                for (bin, &count) in histogram.iter().enumerate() {
+                    if count > 0 {
+                        let height = (count as f32 / max_value) * rect.height();
+                        let x = rect.min.x + bin as f32 * bar_width;
+                        let y = rect.max.y - height;
+                        
+                        let bar_rect = egui::Rect::from_min_size(
+                            egui::pos2(x, y),
+                            egui::vec2(bar_width.max(1.0), height),
+                        );
+                        
+                        ui.painter().rect_filled(
+                            bar_rect,
+                            egui::Rounding::ZERO,
+                            egui::Color32::from_rgba_unmultiplied(
+                                color.r(),
+                                color.g(),
+                                color.b(),
+                                150, // More opaque
+                            ),
+                        );
+                    }
+                }
+            }
+            
+            // Draw border
+            ui.painter().rect_stroke(
+                rect,
+                egui::Rounding::same(2),
+                egui::Stroke::new(1.0, egui::Color32::GRAY),
+                egui::StrokeKind::Outside,
+            );
+            
+            // Draw axis labels
+            ui.painter().text(
+                rect.min + egui::vec2(5.0, 5.0),
+                egui::Align2::LEFT_TOP,
+                format!("Histogram (Max: {})", max_value as u32),
+                egui::FontId::proportional(14.0),
+                egui::Color32::WHITE,
+            );
+            
+            // X-axis labels (pixel values)
+            for i in (0..=256).step_by(32) {
+                let x = rect.min.x + (i as f32 / 256.0) * rect.width();
+                ui.painter().text(
+                    egui::pos2(x, rect.max.y + 5.0),
+                    egui::Align2::CENTER_TOP,
+                    i.to_string(),
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::LIGHT_GRAY,
+                );
+            }
+            
+            // Y-axis labels (count values)
+            for i in 0..5 {
+                let y = rect.max.y - (i as f32 / 4.0) * rect.height();
+                let count = (max_value * i as f32 / 4.0) as u32;
+                ui.painter().text(
+                    egui::pos2(rect.min.x - 5.0, y),
+                    egui::Align2::RIGHT_CENTER,
+                    count.to_string(),
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::LIGHT_GRAY,
+                );
+            }
+            
+            // Display hover information similar to pixel info
+            if let (Some((bin, count, percentage)), Some(hover_pos)) = (*histogram_hover_info, *histogram_hover_pos) {
+                let text_pos = egui::pos2(hover_pos.x + 15.0, hover_pos.y - 50.0);
+                
+                // Show detailed information for each channel
+                let red_count = histograms[0][bin as usize];
+                let green_count = histograms[1][bin as usize];
+                let blue_count = histograms[2][bin as usize];
+                
+                let text_content = if red_count == green_count && green_count == blue_count {
+                    // Grayscale image
+                    format!("Value: {}\nCount: {} ({:.2}%)", bin, count, percentage)
+                } else {
+                    // Color image - show all channels
+                    format!("Value: {}\nRed: {}\nGreen: {}\nBlue: {}\nTotal: {:.2}%", 
+                           bin, red_count, green_count, blue_count, percentage)
+                };
+                
+                // Create a background for the text
+                let text_galley = ui.painter().layout(
+                    text_content.clone(),
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::WHITE,
+                    200.0, // Max width for text wrapping
+                );
+                
+                let text_rect = egui::Rect::from_min_size(
+                    text_pos,
+                    text_galley.size() + egui::vec2(12.0, 8.0),
+                );
+                
+                // Draw background
+                ui.painter().rect_filled(
+                    text_rect,
+                    egui::Rounding::same(4),
+                    egui::Color32::from_black_alpha(220),
+                );
+                
+                // Draw border
+                ui.painter().rect_stroke(
+                    text_rect,
+                    egui::Rounding::same(4),
+                    egui::Stroke::new(1.5, egui::Color32::LIGHT_GRAY),
+                    egui::StrokeKind::Outside,
+                );
+                
+                // Draw text
+                ui.painter().galley(
+                    text_pos + egui::vec2(6.0, 4.0),
+                    text_galley,
+                    egui::Color32::WHITE,
+                );
+            }
+        });
+        
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Channels: ");
+            ui.colored_label(egui::Color32::from_rgb(255, 80, 80), "■ Red");
+            ui.colored_label(egui::Color32::from_rgb(80, 255, 80), "■ Green");
+            ui.colored_label(egui::Color32::from_rgb(80, 80, 255), "■ Blue");
+            ui.separator();
+            ui.label("Hover over histogram to see detailed values");
+        });
+    }
+
+
     fn calculate_histogram(&mut self) {
         if let Some(image) = &self.image {
             let (width, height) = image.dimensions();
@@ -463,7 +931,13 @@ impl ImageViewerApp {
                 }
             }
             
-            self.histogram_data = Some(histograms);
+            self.histogram_data = Some(histograms.clone());
+            
+            // Update shared data for the separate window
+            if let Ok(mut shared) = self.histogram_shared_data.lock() {
+                shared.histograms = Some(histograms);
+            }
+            
             self.histogram_needs_update = false;
         }
     }
@@ -569,10 +1043,12 @@ impl eframe::App for ImageViewerApp {
         // Store zoom info for use in central panel
         let mut zoom_info: Option<(egui::Pos2, f32, f32)> = None;
         if let Some(pointer_pos) = ctx.input(|i| i.pointer.hover_pos()) {
-            let zoom_delta = ctx.input(|i| i.zoom_delta());
+            let scroll_delta = ctx.input(|i| i.raw_scroll_delta);
             
-            if zoom_delta != 1.0 {
+            if scroll_delta.y != 0.0 {
                 let old_scale = self.scale;
+                // Convert scroll to zoom_delta format (scroll up = zoom in)
+                let zoom_delta = if scroll_delta.y > 0.0 { 1.1 } else { 1.0 / 1.1 };
                 let new_scale = (self.scale * zoom_delta).clamp(0.1, 20.0);
                 
                 if old_scale != new_scale {
@@ -639,10 +1115,6 @@ impl eframe::App for ImageViewerApp {
                     }
                 }
 
-                ui.label("Scale:");
-                if ui.add(egui::Slider::new(&mut self.scale, 0.1..=20.0)).changed() {
-                    self.texture_needs_update = true;
-                }
             });
             
             // Second row: Normalization
@@ -686,9 +1158,20 @@ impl eframe::App for ImageViewerApp {
                 ui.separator();
                 
                 if ui.button("Histogram").clicked() {
-                    self.show_histogram = !self.show_histogram;
-                    if self.show_histogram && self.histogram_needs_update {
-                        self.calculate_histogram();
+                    if self.show_histogram {
+                        // Close the histogram window
+                        self.show_histogram = false;
+                        self.histogram_window_id = None;
+                    } else {
+                        // Open the histogram window
+                        self.show_histogram = true;
+                        if self.histogram_needs_update {
+                            self.calculate_histogram();
+                        }
+                        
+                        // Create a new viewport for the histogram window
+                        let histogram_id = egui::ViewportId::from_hash_of("histogram_window");
+                        self.histogram_window_id = Some(histogram_id);
                     }
                 }
                 
@@ -954,199 +1437,78 @@ impl eframe::App for ImageViewerApp {
                     ui.label("No image loaded. Click 'Open Image' to load an image.");
                 });
             }
+            
+            // Add scale slider in bottom right corner
+            if self.image.is_some() {
+                let available_rect = ui.available_rect_before_wrap();
+                let slider_width = 200.0;
+                let slider_height = 20.0;
+                let margin = 10.0;
+                
+                let slider_pos = egui::pos2(
+                    available_rect.max.x - slider_width - margin,
+                    available_rect.max.y - slider_height - margin
+                );
+                
+                let slider_rect = egui::Rect::from_min_size(slider_pos, egui::vec2(slider_width, slider_height));
+                
+                // Draw background for the slider
+                ui.painter().rect_filled(
+                    slider_rect.expand(5.0),
+                    egui::Rounding::same(5),
+                    egui::Color32::from_black_alpha(150),
+                );
+                
+                ui.allocate_ui_at_rect(slider_rect, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Scale:");
+                        if ui.add(egui::Slider::new(&mut self.scale, 0.1..=20.0).show_value(true)).changed() {
+                            self.texture_needs_update = true;
+                        }
+                    });
+                });
+            }
         });
         
-        // Show histogram window if enabled
+        // Show histogram in a separate OS window if enabled
         if self.show_histogram && self.image.is_some() {
-            // Calculate histogram if needed
-            if self.histogram_needs_update {
-                self.calculate_histogram();
-            }
-            
-            egui::Window::new("Histogram")
-                .default_size(egui::vec2(400.0, 300.0))
-                .show(ctx, |ui| {
-                    if let Some(histograms) = &self.histogram_data {
-                        let available_size = ui.available_size();
-                        let plot_size = egui::vec2(available_size.x, available_size.y - 20.0);
-                        
-                        ui.allocate_ui(plot_size, |ui| {
-                            let rect = ui.available_rect_before_wrap();
-                            
-                            // Handle mouse hover for histogram info
-                            if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
-                                if rect.contains(hover_pos) {
-                                    // Calculate which bin we're hovering over
-                                    let relative_x = hover_pos.x - rect.min.x;
-                                    let bin = ((relative_x / rect.width()) * 256.0) as usize;
+            if let Some(histogram_id) = self.histogram_window_id {
+                // Calculate histogram if needed
+                if self.histogram_needs_update {
+                    self.calculate_histogram();
+                }
+                
+                // Clone the shared data for the viewport closure
+                let shared_data = Arc::clone(&self.histogram_shared_data);
+                
+                // Create the actual separate window using viewports
+                ctx.show_viewport_deferred(
+                    histogram_id,
+                    egui::ViewportBuilder::default()
+                        .with_title("Histogram")
+                        .with_inner_size([800.0, 500.0])
+                        .with_min_inner_size([600.0, 400.0])
+                        .with_resizable(true),
+                    move |ctx, _class| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            // Access shared data from the separate window
+                            if let Ok(mut data) = shared_data.lock() {
+                                if let Some(histograms) = data.histograms.clone() {
+                                    // Handle the rendering with separate scope for mutable borrows
+                                    let mut hover_info = data.hover_info;
+                                    let mut hover_pos = data.hover_pos;
                                     
-                                    if bin < 256 {
-                                        // Get counts for all channels
-                                        let red_count = histograms[0][bin];
-                                        let green_count = histograms[1][bin];
-                                        let blue_count = histograms[2][bin];
-                                        
-                                        // For grayscale images (where R=G=B), just use one count
-                                        let display_count = if red_count == green_count && green_count == blue_count {
-                                            red_count
-                                        } else {
-                                            red_count.max(green_count).max(blue_count)
-                                        };
-                                        
-                                        // Calculate total pixels for percentage
-                                        let total_pixels: u32 = histograms[0].iter().sum();
-                                        let percentage = if total_pixels > 0 {
-                                            (display_count as f32 / total_pixels as f32) * 100.0
-                                        } else {
-                                            0.0
-                                        };
-                                        
-                                        self.histogram_hover_info = Some((bin as u32, display_count, percentage));
-                                        self.histogram_hover_pos = Some(hover_pos);
-                                    }
-                                } else {
-                                    self.histogram_hover_info = None;
-                                    self.histogram_hover_pos = None;
-                                }
-                            } else {
-                                self.histogram_hover_info = None;
-                                self.histogram_hover_pos = None;
-                            }
-                            
-                            // Find max value for scaling
-                            let max_value = histograms.iter()
-                                .flat_map(|h| h.iter())
-                                .cloned()
-                                .max()
-                                .unwrap_or(1) as f32;
-                            
-                            // Draw histogram bars
-                            let bar_width = rect.width() / 256.0;
-                            let colors = [
-                                egui::Color32::from_rgb(255, 100, 100), // Red
-                                egui::Color32::from_rgb(100, 255, 100), // Green
-                                egui::Color32::from_rgb(100, 100, 255), // Blue
-                            ];
-                            
-                            // Draw background
-                            ui.painter().rect_filled(
-                                rect,
-                                egui::Rounding::same(2),
-                                egui::Color32::from_gray(20),
-                            );
-                            
-                            // Draw histogram for each channel
-                            for (channel, histogram) in histograms.iter().enumerate() {
-                                let color = colors[channel];
-                                
-                                for (bin, &count) in histogram.iter().enumerate() {
-                                    if count > 0 {
-                                        let height = (count as f32 / max_value) * rect.height();
-                                        let x = rect.min.x + bin as f32 * bar_width;
-                                        let y = rect.max.y - height;
-                                        
-                                        let bar_rect = egui::Rect::from_min_size(
-                                            egui::pos2(x, y),
-                                            egui::vec2(bar_width.max(1.0), height),
-                                        );
-                                        
-                                        ui.painter().rect_filled(
-                                            bar_rect,
-                                            egui::Rounding::ZERO,
-                                            egui::Color32::from_rgba_unmultiplied(
-                                                color.r(),
-                                                color.g(),
-                                                color.b(),
-                                                100, // Semi-transparent
-                                            ),
-                                        );
-                                    }
+                                    Self::render_histogram_in_viewport(ui, &histograms, &mut hover_info, &mut hover_pos);
+                                    
+                                    // Update the shared data
+                                    data.hover_info = hover_info;
+                                    data.hover_pos = hover_pos;
                                 }
                             }
-                            
-                            // Draw border
-                            ui.painter().rect_stroke(
-                                rect,
-                                egui::Rounding::same(2),
-                                egui::Stroke::new(1.0, egui::Color32::GRAY),
-                                egui::StrokeKind::Outside,
-                            );
-                            
-                            // Draw labels
-                            ui.painter().text(
-                                rect.min + egui::vec2(5.0, 5.0),
-                                egui::Align2::LEFT_TOP,
-                                "Histogram",
-                                egui::FontId::proportional(12.0),
-                                egui::Color32::WHITE,
-                            );
-                            
-                            ui.painter().text(
-                                rect.min + egui::vec2(5.0, rect.height() - 20.0),
-                                egui::Align2::LEFT_BOTTOM,
-                                "0",
-                                egui::FontId::proportional(10.0),
-                                egui::Color32::GRAY,
-                            );
-                            
-                            ui.painter().text(
-                                rect.max - egui::vec2(5.0, 20.0),
-                                egui::Align2::RIGHT_BOTTOM,
-                                "255",
-                                egui::FontId::proportional(10.0),
-                                egui::Color32::GRAY,
-                            );
-                            
-                            // Display hover information similar to pixel info
-                            if let (Some((bin, count, percentage)), Some(hover_pos)) = (self.histogram_hover_info, self.histogram_hover_pos) {
-                                let text_pos = egui::pos2(hover_pos.x + 10.0, hover_pos.y - 30.0);
-                                let text_content = format!("Bin: {} | Count: {} ({:.2}%)", bin, count, percentage);
-                                
-                                // Create a background for the text
-                                let text_galley = ui.painter().layout_no_wrap(
-                                    text_content.clone(),
-                                    egui::FontId::proportional(12.0),
-                                    egui::Color32::WHITE,
-                                );
-                                
-                                let text_rect = egui::Rect::from_min_size(
-                                    text_pos,
-                                    text_galley.size() + egui::vec2(8.0, 4.0),
-                                );
-                                
-                                // Draw background
-                                ui.painter().rect_filled(
-                                    text_rect,
-                                    egui::Rounding::same(3),
-                                    egui::Color32::from_black_alpha(200),
-                                );
-                                
-                                // Draw border
-                                ui.painter().rect_stroke(
-                                    text_rect,
-                                    egui::Rounding::same(3),
-                                    egui::Stroke::new(1.0, egui::Color32::GRAY),
-                                    egui::StrokeKind::Outside,
-                                );
-                                
-                                // Draw text
-                                ui.painter().text(
-                                    text_pos + egui::vec2(4.0, 2.0),
-                                    egui::Align2::LEFT_TOP,
-                                    text_content,
-                                    egui::FontId::proportional(12.0),
-                                    egui::Color32::WHITE,
-                                );
-                            }
                         });
-                        
-                        ui.horizontal(|ui| {
-                            ui.colored_label(egui::Color32::from_rgb(255, 100, 100), "Red");
-                            ui.colored_label(egui::Color32::from_rgb(100, 255, 100), "Green");
-                            ui.colored_label(egui::Color32::from_rgb(100, 100, 255), "Blue");
-                        });
-                    }
-                });
+                    },
+                );
+            }
         }
     }
 }
