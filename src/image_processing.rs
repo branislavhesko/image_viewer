@@ -1,4 +1,4 @@
-use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba, Luma};
+use image::{DynamicImage, ImageBuffer, Rgba, Luma};
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::f32::consts::PI;
 

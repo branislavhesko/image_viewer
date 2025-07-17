@@ -21,11 +21,13 @@ struct HistogramData {
     histograms: Option<Vec<Vec<u32>>>,
     hover_info: Option<(u32, u32, f32)>,
     hover_pos: Option<egui::Pos2>,
+    close_requested: bool,
 }
 
 struct ImageViewerApp {
     image: Option<DynamicImage>,
     image_path: Option<PathBuf>,
+    last_opened_folder: Option<PathBuf>,
     scale: f32,
     base_scale: f32, // Scale to fit image in window
     normalization: NormalizationType,
@@ -33,7 +35,6 @@ struct ImageViewerApp {
     texture: Option<egui::TextureHandle>,
     offset: egui::Vec2,
     dragging: bool,
-    last_mouse_pos: Option<egui::Pos2>,
     texture_needs_update: bool,
     last_texture_scale: f32,
     last_normalization: NormalizationType,
@@ -42,7 +43,7 @@ struct ImageViewerApp {
     pixel_info_fp: Option<(u32, u32, f32, f32, f32)>, // (x, y, r, g, b) for floating point images
     pixel_info_channels: Option<u32>, // Number of channels for current pixel info
     show_pixel_tool: bool,
-    click_pos: Option<egui::Pos2>,
+    hover_pos: Option<egui::Pos2>,
     is_floating_point_image: bool,
     original_data_range: Option<(f32, f32)>, // (min, max) of original floating point data
     original_fp_data: Option<Vec<f32>>, // Store original floating point pixel data
@@ -90,6 +91,7 @@ impl Default for ImageViewerApp {
         Self {
             image: None,
             image_path: None,
+            last_opened_folder: None,
             scale: 1.0,
             base_scale: 1.0,
             normalization: NormalizationType::None,
@@ -97,7 +99,6 @@ impl Default for ImageViewerApp {
             texture: None,
             offset: egui::Vec2::ZERO,
             dragging: false,
-            last_mouse_pos: None,
             texture_needs_update: false,
             last_texture_scale: 1.0,
             last_normalization: NormalizationType::None,
@@ -106,7 +107,7 @@ impl Default for ImageViewerApp {
             pixel_info_fp: None,
             pixel_info_channels: None,
             show_pixel_tool: false,
-            click_pos: None,
+            hover_pos: None,
             is_floating_point_image: false,
             original_data_range: None,
             original_fp_data: None,
@@ -138,7 +139,11 @@ impl ImageViewerApp {
         
         // Store original image without resizing
         self.image = Some(img);
-        self.image_path = Some(path);
+        self.image_path = Some(path.clone());
+        // Store the folder path for future file dialogs
+        if let Some(parent) = path.parent() {
+            self.last_opened_folder = Some(parent.to_path_buf());
+        }
         self.is_floating_point_image = is_fp;
         self.original_data_range = data_range;
         // Store floating point data if available
@@ -444,7 +449,7 @@ impl ImageViewerApp {
             // Draw background
             ui.painter().rect_filled(
                 rect,
-                egui::Rounding::same(2),
+                egui::CornerRadius::same(2),
                 egui::Color32::from_gray(15),
             );
             
@@ -484,7 +489,7 @@ impl ImageViewerApp {
                         
                         ui.painter().rect_filled(
                             bar_rect,
-                            egui::Rounding::ZERO,
+                            egui::CornerRadius::ZERO,
                             egui::Color32::from_rgba_unmultiplied(
                                 color.r(),
                                 color.g(),
@@ -499,7 +504,7 @@ impl ImageViewerApp {
             // Draw border
             ui.painter().rect_stroke(
                 rect,
-                egui::Rounding::same(2),
+                egui::CornerRadius::same(2),
                 egui::Stroke::new(1.0, egui::Color32::GRAY),
                 egui::StrokeKind::Outside,
             );
@@ -572,14 +577,14 @@ impl ImageViewerApp {
                 // Draw background
                 ui.painter().rect_filled(
                     text_rect,
-                    egui::Rounding::same(4),
+                    egui::CornerRadius::same(4),
                     egui::Color32::from_black_alpha(220),
                 );
                 
                 // Draw border
                 ui.painter().rect_stroke(
                     text_rect,
-                    egui::Rounding::same(4),
+                    egui::CornerRadius::same(4),
                     egui::Stroke::new(1.5, egui::Color32::LIGHT_GRAY),
                     egui::StrokeKind::Outside,
                 );
@@ -604,6 +609,7 @@ impl ImageViewerApp {
         });
     }
 
+    #[allow(dead_code)]
     fn render_histogram_static(
         ui: &mut egui::Ui, 
         histograms: &[Vec<u32>], 
@@ -674,7 +680,7 @@ impl ImageViewerApp {
             // Draw background
             ui.painter().rect_filled(
                 rect,
-                egui::Rounding::same(2),
+                egui::CornerRadius::same(2),
                 egui::Color32::from_gray(15),
             );
             
@@ -714,7 +720,7 @@ impl ImageViewerApp {
                         
                         ui.painter().rect_filled(
                             bar_rect,
-                            egui::Rounding::ZERO,
+                            egui::CornerRadius::ZERO,
                             egui::Color32::from_rgba_unmultiplied(
                                 color.r(),
                                 color.g(),
@@ -729,7 +735,7 @@ impl ImageViewerApp {
             // Draw border
             ui.painter().rect_stroke(
                 rect,
-                egui::Rounding::same(2),
+                egui::CornerRadius::same(2),
                 egui::Stroke::new(1.0, egui::Color32::GRAY),
                 egui::StrokeKind::Outside,
             );
@@ -802,14 +808,14 @@ impl ImageViewerApp {
                 // Draw background
                 ui.painter().rect_filled(
                     text_rect,
-                    egui::Rounding::same(4),
+                    egui::CornerRadius::same(4),
                     egui::Color32::from_black_alpha(220),
                 );
                 
                 // Draw border
                 ui.painter().rect_stroke(
                     text_rect,
-                    egui::Rounding::same(4),
+                    egui::CornerRadius::same(4),
                     egui::Stroke::new(1.5, egui::Color32::LIGHT_GRAY),
                     egui::StrokeKind::Outside,
                 );
@@ -1016,7 +1022,7 @@ impl ImageViewerApp {
 }
 
 impl eframe::App for ImageViewerApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Handle file drops
         let mut file_dropped = false;
         ctx.input(|i| {
@@ -1082,15 +1088,34 @@ impl eframe::App for ImageViewerApp {
                         .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "gif", "avif", "hdr", "exr", "farbfeld", "qoi", "dds", "tga", "pnm", "ff", "ico"]);
                     
                     // Try to set a sensible default directory
-                    let file_dialog = if let Ok(home_dir) = env::var("HOME") {
-                        let pictures_dir = PathBuf::from(home_dir).join("Pictures");
-                        if pictures_dir.exists() {
-                            file_dialog.set_directory(pictures_dir)
+                    let file_dialog = if let Some(last_folder) = &self.last_opened_folder {
+                        if last_folder.exists() {
+                            file_dialog.set_directory(last_folder)
+                        } else {
+                            // Fallback to Pictures or current directory if last folder doesn't exist
+                            if let Ok(home_dir) = env::var("HOME") {
+                                let pictures_dir = PathBuf::from(home_dir).join("Pictures");
+                                if pictures_dir.exists() {
+                                    file_dialog.set_directory(pictures_dir)
+                                } else {
+                                    file_dialog.set_directory(env::current_dir().unwrap_or_default())
+                                }
+                            } else {
+                                file_dialog.set_directory(env::current_dir().unwrap_or_default())
+                            }
+                        }
+                    } else {
+                        // No last folder, use Pictures or current directory
+                        if let Ok(home_dir) = env::var("HOME") {
+                            let pictures_dir = PathBuf::from(home_dir).join("Pictures");
+                            if pictures_dir.exists() {
+                                file_dialog.set_directory(pictures_dir)
+                            } else {
+                                file_dialog.set_directory(env::current_dir().unwrap_or_default())
+                            }
                         } else {
                             file_dialog.set_directory(env::current_dir().unwrap_or_default())
                         }
-                    } else {
-                        file_dialog.set_directory(env::current_dir().unwrap_or_default())
                     };
                     
                     if let Some(path) = file_dialog.pick_file() {
@@ -1281,10 +1306,10 @@ impl eframe::App for ImageViewerApp {
                     
                     let image_rect = egui::Rect::from_min_size(image_pos, display_size);
                     
-                    // Handle pixel tool clicking
+                    // Handle pixel tool hovering
                     if self.show_pixel_tool {
                         if let Some(pointer_pos) = ui.input(|i| i.pointer.interact_pos()) {
-                            if image_rect.contains(pointer_pos) && ui.input(|i| i.pointer.primary_clicked()) {
+                            if image_rect.contains(pointer_pos) {
                                 // Convert screen coordinates to image coordinates
                                 let relative_pos = pointer_pos - image_rect.min;
                                 let image_x = (relative_pos.x / final_scale) as u32;
@@ -1293,7 +1318,7 @@ impl eframe::App for ImageViewerApp {
                                 // Sample pixel from original image
                                 if image_x < orig_width && image_y < orig_height {
                                     // Check if we have original floating point data
-                                    if let (Some(fp_data), Some((fp_width, fp_height)), Some(fp_channels)) = (
+                                    if let (Some(fp_data), Some((fp_width, _fp_height)), Some(fp_channels)) = (
                                         &self.original_fp_data,
                                         self.original_fp_dimensions,
                                         self.original_fp_channels
@@ -1356,9 +1381,21 @@ impl eframe::App for ImageViewerApp {
                                             _ => 3, // Default to RGB for other types
                                         });
                                     }
-                                    self.click_pos = Some(pointer_pos);
+                                    self.hover_pos = Some(pointer_pos);
                                 }
+                            } else {
+                                // Clear pixel info when not hovering over image
+                                self.pixel_info = None;
+                                self.pixel_info_fp = None;
+                                self.pixel_info_channels = None;
+                                self.hover_pos = None;
                             }
+                        } else {
+                            // Clear pixel info when no pointer interaction
+                            self.pixel_info = None;
+                            self.pixel_info_fp = None;
+                            self.pixel_info_channels = None;
+                            self.hover_pos = None;
                         }
                     }
                     
@@ -1369,9 +1406,9 @@ impl eframe::App for ImageViewerApp {
                         ui.put(image_rect, image);
                     }
                     
-                    // Display click information near cursor (after image to render on top)
-                    if let Some(click_pos) = self.click_pos {
-                        let text_pos = egui::pos2(click_pos.x + 2.0, click_pos.y - 20.0);
+                    // Display hover information near cursor (after image to render on top)
+                    if let Some(hover_pos) = self.hover_pos {
+                        let text_pos = egui::pos2(hover_pos.x + 2.0, hover_pos.y - 20.0);
                         let text_content = if let Some((x, y, r, g, b)) = self.pixel_info_fp {
                             // Show original floating point values
                             match self.pixel_info_channels {
@@ -1405,14 +1442,14 @@ impl eframe::App for ImageViewerApp {
                         // Draw background
                         ui.painter().rect_filled(
                             text_rect,
-                            egui::Rounding::same(3),
+                            egui::CornerRadius::same(3),
                             egui::Color32::from_black_alpha(200),
                         );
                         
                         // Draw border
                         ui.painter().rect_stroke(
                             text_rect,
-                            egui::Rounding::same(3),
+                            egui::CornerRadius::same(3),
                             egui::Stroke::new(1.0, egui::Color32::GRAY),
                             egui::StrokeKind::Outside,
                         );
@@ -1438,37 +1475,30 @@ impl eframe::App for ImageViewerApp {
                 });
             }
             
-            // Add scale slider in bottom right corner
-            if self.image.is_some() {
-                let available_rect = ui.available_rect_before_wrap();
-                let slider_width = 200.0;
-                let slider_height = 20.0;
-                let margin = 10.0;
-                
-                let slider_pos = egui::pos2(
-                    available_rect.max.x - slider_width - margin,
-                    available_rect.max.y - slider_height - margin
-                );
-                
-                let slider_rect = egui::Rect::from_min_size(slider_pos, egui::vec2(slider_width, slider_height));
-                
-                // Draw background for the slider
-                ui.painter().rect_filled(
-                    slider_rect.expand(5.0),
-                    egui::Rounding::same(5),
-                    egui::Color32::from_black_alpha(150),
-                );
-                
-                ui.allocate_ui_at_rect(slider_rect, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Scale:");
-                        if ui.add(egui::Slider::new(&mut self.scale, 0.1..=20.0).show_value(true)).changed() {
-                            self.texture_needs_update = true;
-                        }
-                    });
-                });
-            }
         });
+        
+        // Add scale slider in bottom right corner (fixed position)
+        if self.image.is_some() {
+            egui::Area::new(egui::Id::new("scale_bar"))
+                .fixed_pos(egui::pos2(
+                    ctx.screen_rect().max.x - 220.0,
+                    ctx.screen_rect().max.y - 40.0
+                ))
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_black_alpha(150))
+                        .corner_radius(egui::CornerRadius::same(5))
+                        .inner_margin(egui::Margin::same(5))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Scale:");
+                                if ui.add(egui::Slider::new(&mut self.scale, 0.1..=20.0).show_value(true)).changed() {
+                                    self.texture_needs_update = true;
+                                }
+                            });
+                        });
+                });
+        }
         
         // Show histogram in a separate OS window if enabled
         if self.show_histogram && self.image.is_some() {
@@ -1490,6 +1520,15 @@ impl eframe::App for ImageViewerApp {
                         .with_min_inner_size([600.0, 400.0])
                         .with_resizable(true),
                     move |ctx, _class| {
+                        // Check if the window should be closed
+                        if ctx.input(|i| i.viewport().close_requested()) {
+                            // Set the close flag in shared data
+                            if let Ok(mut data) = shared_data.lock() {
+                                data.close_requested = true;
+                            }
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        
                         egui::CentralPanel::default().show(ctx, |ui| {
                             // Access shared data from the separate window
                             if let Ok(mut data) = shared_data.lock() {
@@ -1508,6 +1547,18 @@ impl eframe::App for ImageViewerApp {
                         });
                     },
                 );
+            }
+        } else {
+            // Clear the histogram window ID if histogram is not shown
+            self.histogram_window_id = None;
+        }
+        
+        // Check if histogram window was closed externally
+        if let Ok(mut data) = self.histogram_shared_data.lock() {
+            if data.close_requested {
+                self.show_histogram = false;
+                self.histogram_window_id = None;
+                data.close_requested = false; // Reset the flag
             }
         }
     }
