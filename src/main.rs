@@ -13,6 +13,7 @@ use log::{info, error, warn};
 use std::io::BufReader;
 use std::fs::File;
 use std::sync::{Arc, Mutex};
+use std::fs;
 
 const ICON: &[u8] = include_bytes!("../assets/icon.png");
 
@@ -54,6 +55,8 @@ struct ImageViewerApp {
     histogram_needs_update: bool, // Whether histogram needs recalculation
     histogram_shared_data: Arc<Mutex<HistogramData>>, // Shared data for histogram window
     histogram_window_id: Option<egui::ViewportId>, // ID of the histogram window
+    folder_images: Vec<PathBuf>, // List of images in current folder
+    current_image_index: Option<usize>, // Index of current image in folder_images
 }
 
 // TODO: FFT is not queite Normalization, but it is a transformation, need to be fixed
@@ -118,6 +121,8 @@ impl Default for ImageViewerApp {
             histogram_needs_update: false,
             histogram_shared_data: Arc::new(Mutex::new(HistogramData::default())),
             histogram_window_id: None,
+            folder_images: Vec::new(),
+            current_image_index: None,
         }
     }
 }
@@ -125,6 +130,79 @@ impl Default for ImageViewerApp {
 impl ImageViewerApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self::default()
+    }
+
+    fn scan_folder_images(&mut self, current_path: &PathBuf) {
+        self.folder_images.clear();
+        self.current_image_index = None;
+        
+        if let Some(parent_dir) = current_path.parent() {
+            if let Ok(entries) = fs::read_dir(parent_dir) {
+                let supported_extensions = [
+                    "png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "gif", 
+                    "avif", "hdr", "exr", "farbfeld", "qoi", "dds", "tga", 
+                    "pnm", "ff", "ico"
+                ];
+                
+                let mut image_files: Vec<PathBuf> = entries
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| entry.file_type().ok().map_or(false, |ft| ft.is_file()))
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        if let Some(ext) = path.extension() {
+                            let ext_str = ext.to_string_lossy().to_lowercase();
+                            supported_extensions.contains(&ext_str.as_str())
+                        } else {
+                            false
+                        }
+                    })
+                    .collect();
+                
+                // Sort alphabetically
+                image_files.sort();
+                
+                // Find current image index
+                if let Some(current_index) = image_files.iter().position(|p| p == current_path) {
+                    self.current_image_index = Some(current_index);
+                }
+                
+                self.folder_images = image_files;
+                info!("Found {} images in folder, current index: {:?}", 
+                      self.folder_images.len(), self.current_image_index);
+            }
+        }
+    }
+
+    fn navigate_to_adjacent_image(&mut self, direction: i32) -> anyhow::Result<()> {
+        if self.folder_images.is_empty() {
+            return Ok(());
+        }
+        
+        let current_index = self.current_image_index.unwrap_or(0);
+        let new_index = if direction < 0 {
+            // Previous image (left arrow)
+            if current_index == 0 {
+                self.folder_images.len() - 1 // Wrap to last image
+            } else {
+                current_index - 1
+            }
+        } else {
+            // Next image (right arrow)
+            if current_index >= self.folder_images.len() - 1 {
+                0 // Wrap to first image
+            } else {
+                current_index + 1
+            }
+        };
+        
+        if new_index < self.folder_images.len() {
+            let new_path = self.folder_images[new_index].clone();
+            info!("Navigating to image {}/{}: {:?}", 
+                  new_index + 1, self.folder_images.len(), new_path);
+            self.load_image(new_path)?;
+        }
+        
+        Ok(())
     }
 
     fn load_image(&mut self, path: PathBuf) -> anyhow::Result<()> {
@@ -161,6 +239,10 @@ impl ImageViewerApp {
         // Mark histogram for update
         self.histogram_needs_update = true;
         self.histogram_data = None;
+        
+        // Scan folder for adjacent images
+        self.scan_folder_images(&path);
+        
         Ok(())
     }
     
@@ -1046,6 +1128,20 @@ impl eframe::App for ImageViewerApp {
             ctx.request_repaint();
         }
 
+        // Handle keyboard navigation
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::ArrowLeft) {
+                if let Err(e) = self.navigate_to_adjacent_image(-1) {
+                    error!("Failed to navigate to previous image: {}", e);
+                }
+            }
+            if i.key_pressed(egui::Key::ArrowRight) {
+                if let Err(e) = self.navigate_to_adjacent_image(1) {
+                    error!("Failed to navigate to next image: {}", e);
+                }
+            }
+        });
+
         // Store zoom info for use in central panel
         let mut zoom_info: Option<(egui::Pos2, f32, f32)> = None;
         if let Some(pointer_pos) = ctx.input(|i| i.pointer.hover_pos()) {
@@ -1135,7 +1231,15 @@ impl eframe::App for ImageViewerApp {
                 // Show filename of currently loaded image
                 if let Some(path) = &self.image_path {
                     if let Some(filename) = path.file_name() {
-                        ui.label(format!("File: {}", filename.to_string_lossy()));
+                        let file_info = if let Some(index) = self.current_image_index {
+                            format!("File: {} ({}/{})", 
+                                   filename.to_string_lossy(), 
+                                   index + 1, 
+                                   self.folder_images.len())
+                        } else {
+                            format!("File: {}", filename.to_string_lossy())
+                        };
+                        ui.label(file_info);
                         ui.separator();
                     }
                 }
@@ -1201,6 +1305,12 @@ impl eframe::App for ImageViewerApp {
                 }
                 
                 ui.separator();
+                
+                // Show navigation hint if we have multiple images in folder
+                if self.folder_images.len() > 1 {
+                    ui.label("Navigate: ← → arrows");
+                    ui.separator();
+                }
                 
                 if let Some(img) = &self.image {
                     let (width, height) = img.dimensions();
