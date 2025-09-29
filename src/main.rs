@@ -7,7 +7,8 @@ use eframe::icon_data::from_png_bytes;
 
 use image::{DynamicImage, GenericImageView, ImageBuffer};
 use std::path::PathBuf;
-use image_processing::{min_max_normalize, standardize, log_min_max_normalize, fft};
+use image_processing::{min_max_normalize, standardize, log_min_max_normalize, fft,
+                       min_max_normalize_fp, standardize_fp, log_min_max_normalize_fp};
 use std::env;
 use log::{info, error, warn};
 use std::io::BufReader;
@@ -1059,12 +1060,29 @@ impl ImageViewerApp {
                 img.clone()
             };
             
-            let normalized_img = match self.normalization {
-                NormalizationType::None => working_img,
-                NormalizationType::MinMax => min_max_normalize(&working_img),
-                NormalizationType::LogMinMax => log_min_max_normalize(&working_img),
-                NormalizationType::Standard => standardize(&working_img),
-                NormalizationType::FFT => fft(&working_img),
+            // Use original floating-point data for normalization if available
+            let normalized_img = if let (Some(fp_data), Some((fp_width, fp_height)), Some(fp_channels)) =
+                (&self.original_fp_data, self.original_fp_dimensions, self.original_fp_channels) {
+                // We have floating-point data, use it for proper normalization
+                match self.normalization {
+                    NormalizationType::None => {
+                        // For None, still use the working_img (already converted to u8)
+                        working_img
+                    },
+                    NormalizationType::MinMax => min_max_normalize_fp(fp_data, fp_width, fp_height, fp_channels),
+                    NormalizationType::LogMinMax => log_min_max_normalize_fp(fp_data, fp_width, fp_height, fp_channels),
+                    NormalizationType::Standard => standardize_fp(fp_data, fp_width, fp_height, fp_channels),
+                    NormalizationType::FFT => fft(&working_img), // FFT still uses converted image
+                }
+            } else {
+                // No floating-point data, use regular normalization on u8 data
+                match self.normalization {
+                    NormalizationType::None => working_img,
+                    NormalizationType::MinMax => min_max_normalize(&working_img),
+                    NormalizationType::LogMinMax => log_min_max_normalize(&working_img),
+                    NormalizationType::Standard => standardize(&working_img),
+                    NormalizationType::FFT => fft(&working_img),
+                }
             };
 
             let (width, height) = normalized_img.dimensions();
@@ -1308,7 +1326,7 @@ impl eframe::App for ImageViewerApp {
                 
                 // Show navigation hint if we have multiple images in folder
                 if self.folder_images.len() > 1 {
-                    ui.label("Navigate: ← → arrows");
+                    ui.label("Navigate: < > arrow keys");
                     ui.separator();
                 }
                 
