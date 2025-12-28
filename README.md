@@ -37,12 +37,41 @@ A minimalistic Rust image viewer with advanced features for scientific and techn
 - **Value display**: Shows RGB values for regular images or floating point values for FP images
 - **Channel-aware**: Displays appropriate format based on image type (Grayscale vs RGB)
 
+### Drawing and Annotation Tools
+
+#### Drawing Modes
+- **Free Draw**: Freehand drawing with mouse
+- **Rectangle**: Draw rectangular shapes (filled or outline)
+- **Line**: Draw straight lines
+- **Arrow**: Draw arrows for annotations
+- **Text**: Add text labels to images
+
+#### Drawing Features
+- **Color picker**: Choose any color for drawings
+- **Stroke thickness**: Adjustable line width (1-20 pixels)
+- **Fill option**: Toggle filled/outline for rectangles
+- **Font size**: Adjustable text size (8-72 points)
+- **Undo/Redo**: Full undo/redo support (Ctrl/Cmd+Z, Ctrl/Cmd+Y)
+- **Clear all**: Remove all annotations at once
+
+#### Annotation Persistence
+- **Save annotations**: Save drawings as separate `.annotations.json` files
+- **Auto-load**: Annotations automatically load with images
+- **Export**: Bake annotations into new image files (PNG/JPEG)
+- **Non-destructive**: Original images remain untouched
+
 ## Controls
 
 ### Mouse Interaction
 - **Zoom**: CTRL + Mouse wheel to zoom in/out (0.1x to 20x magnification)
-- **Pan**: Left mouse button drag to pan the image (when pixel tool is disabled)
+- **Pan**: Left mouse button drag to pan the image (when not in drawing mode)
+- **Draw**: Click and drag to draw when drawing mode is enabled
 - **Pixel sampling**: Left click to sample pixel values (when pixel tool is enabled)
+
+### Keyboard Shortcuts
+- **Arrow Left/Right**: Navigate to previous/next image in folder
+- **Ctrl/Cmd + Z**: Undo last drawing action
+- **Ctrl/Cmd + Shift + Z** or **Ctrl/Cmd + Y**: Redo drawing action
 
 ### UI Controls
 - **Open Image**: Button to open file dialog
@@ -51,6 +80,7 @@ A minimalistic Rust image viewer with advanced features for scientific and techn
 - **Channel dropdown**: Select which channels to display
 - **Pixel Info checkbox**: Toggle pixel inspection mode
 - **Histogram button**: Toggle histogram window
+- **Drawing Mode checkbox**: Enable/disable annotation tools
 
 ### Loading Images
 - **File dialog**: Use "Open Image" button
@@ -73,17 +103,42 @@ A minimalistic Rust image viewer with advanced features for scientific and techn
 
 ## Installation
 
-### From Source
+### Quick Install (macOS/Linux)
+
+```bash
+git clone https://github.com/branislavhesko/image_viewer.git
+cd image_viewer
+./install.sh
+```
+
+This will:
+- Build the release version
+- Create a system application
+- Install to `/Applications` (macOS) or system/user bin (Linux)
+
+### Manual Installation
+
+See [INSTALL.md](INSTALL.md) for detailed installation instructions including:
+- macOS app bundle creation
+- Linux system-wide or user installation
+- Windows installation
+- Uninstallation steps
+
+### From Source (Development)
 ```bash
 git clone https://github.com/branislavhesko/image_viewer.git
 cd image_viewer
 cargo build --release
+cargo run --release
 ```
 
 ### From Releases
 Download precompiled binaries from the [Releases page](https://github.com/branislavhesko/image_viewer/releases):
-- `image_viewer-linux-x86_64` - Linux executable
-- `image_viewer-windows-x86_64.exe` - Windows executable
+- **Linux (x86_64)**: `image_viewer-linux-x86_64`
+- **Windows (x86_64)**: `image_viewer-windows-x86_64.exe`
+- **macOS (Apple Silicon/ARM64)**: `ImageViewer-macos-arm64.app.zip`
+
+**Note**: macOS Intel (x86_64) is not supported. Only Apple Silicon Macs (M1, M2, M3, etc.) are supported.
 
 ## Usage Examples
 
