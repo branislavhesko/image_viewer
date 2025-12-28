@@ -20,6 +20,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact_name: image_viewer.exe
             asset_name: image_viewer-windows-x86_64.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: image_viewer
+            asset_name: ImageViewer-macos-arm64.app
 
     steps:
       - name: Checkout code
@@ -41,7 +45,76 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Create macOS app bundle
+        if: matrix.os == 'macos-latest'
+        run: |
+          # Create app bundle structure
+          mkdir -p ${{ matrix.asset_name }}/Contents/MacOS
+          mkdir -p ${{ matrix.asset_name }}/Contents/Resources
+
+          # Copy binary
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} ${{ matrix.asset_name }}/Contents/MacOS/
+
+          # Copy icon if it exists
+          if [ -f "assets/icon.png" ]; then
+            cp assets/icon.png ${{ matrix.asset_name }}/Contents/Resources/
+          fi
+
+          # Create Info.plist
+          cat > ${{ matrix.asset_name }}/Contents/Info.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>image_viewer</string>
+              <key>CFBundleIconFile</key>
+              <string>icon.png</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.imageviewer.app</string>
+              <key>CFBundleName</key>
+              <string>Image Viewer</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${{ github.ref_name }}</string>
+              <key>CFBundleVersion</key>
+              <string>${{ github.ref_name }}</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>11.0</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>CFBundleDocumentTypes</key>
+              <array>
+                  <dict>
+                      <key>CFBundleTypeName</key>
+                      <string>Image</string>
+                      <key>CFBundleTypeRole</key>
+                      <string>Viewer</string>
+                      <key>LSHandlerRank</key>
+                      <string>Alternate</string>
+                      <key>LSItemContentTypes</key>
+                      <array>
+                          <string>public.image</string>
+                          <string>public.png</string>
+                          <string>public.jpeg</string>
+                          <string>public.tiff</string>
+                          <string>com.compuserve.gif</string>
+                      </array>
+                  </dict>
+              </array>
+          </dict>
+          </plist>
+          EOF
+
+          # Make binary executable
+          chmod +x ${{ matrix.asset_name }}/Contents/MacOS/image_viewer
+
+          # Create zip archive for distribution
+          zip -r ${{ matrix.asset_name }}.zip ${{ matrix.asset_name }}
+
       - name: Prepare artifact
+        if: matrix.os != 'macos-latest'
         shell: bash
         run: |
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
@@ -51,7 +124,15 @@ jobs:
             chmod +x ${{ matrix.asset_name }}
           fi
 
-      - name: Upload artifact
+      - name: Upload artifact (macOS)
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}.zip
+
+      - name: Upload artifact (non-macOS)
+        if: matrix.os != 'macos-latest'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
@@ -78,6 +159,21 @@ jobs:
           files: |
             ./artifacts/image_viewer-linux-x86_64/image_viewer-linux-x86_64
             ./artifacts/image_viewer-windows-x86_64.exe/image_viewer-windows-x86_64.exe
+            ./artifacts/ImageViewer-macos-arm64.app/ImageViewer-macos-arm64.app.zip
           name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false
+          body: |
+            ## Downloads
+
+            - **Linux (x86_64)**: `image_viewer-linux-x86_64`
+            - **Windows (x86_64)**: `image_viewer-windows-x86_64.exe`
+            - **macOS (Apple Silicon/ARM64)**: `ImageViewer-macos-arm64.app.zip`
+
+            ### macOS Installation
+            1. Download and unzip `ImageViewer-macos-arm64.app.zip`
+            2. Move `ImageViewer-macos-arm64.app` to your Applications folder
+            3. Right-click and select "Open" the first time to bypass Gatekeeper
+
+            ### Features
+            See [README.md](https://github.com/${{ github.repository }}/blob/main/README.md) for full feature list.

@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod image_processing;
+mod drawing;
 
 use eframe::egui;
 use eframe::icon_data::from_png_bytes;
@@ -15,6 +16,8 @@ use std::io::BufReader;
 use std::fs::File;
 use std::sync::{Arc, Mutex};
 use std::fs;
+use std::collections::HashMap;
+use drawing::*;
 
 const ICON: &[u8] = include_bytes!("../assets/icon.png");
 
@@ -58,6 +61,14 @@ struct ImageViewerApp {
     histogram_window_id: Option<egui::ViewportId>, // ID of the histogram window
     folder_images: Vec<PathBuf>, // List of images in current folder
     current_image_index: Option<usize>, // Index of current image in folder_images
+
+    // Drawing-related fields
+    drawing_enabled: bool,
+    current_tool: DrawingTool,
+    drawing_settings: DrawingSettings,
+    active_drawing: ActiveDrawing,
+    annotation_layers: HashMap<PathBuf, AnnotationLayer>,
+    undo_stack: UndoStack,
 }
 
 // TODO: FFT is not queite Normalization, but it is a transformation, need to be fixed
@@ -124,6 +135,14 @@ impl Default for ImageViewerApp {
             histogram_window_id: None,
             folder_images: Vec::new(),
             current_image_index: None,
+
+            // Drawing-related fields initialization
+            drawing_enabled: false,
+            current_tool: DrawingTool::FreeDraw,
+            drawing_settings: DrawingSettings::default(),
+            active_drawing: ActiveDrawing::None,
+            annotation_layers: HashMap::new(),
+            undo_stack: UndoStack::new(50),
         }
     }
 }
@@ -131,6 +150,544 @@ impl Default for ImageViewerApp {
 impl ImageViewerApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self::default()
+    }
+
+    /// Convert screen coordinates to image coordinates
+    fn screen_to_image_coords(&self, screen_pos: egui::Pos2, image_rect: egui::Rect) -> Option<(f32, f32)> {
+        if let Some(img) = &self.image {
+            if image_rect.contains(screen_pos) {
+                let final_scale = self.base_scale * self.scale;
+                let relative_pos = screen_pos - image_rect.min;
+                let image_x = relative_pos.x / final_scale;
+                let image_y = relative_pos.y / final_scale;
+
+                let (width, height) = img.dimensions();
+                if image_x >= 0.0 && image_x < width as f32 && image_y >= 0.0 && image_y < height as f32 {
+                    return Some((image_x, image_y));
+                }
+            }
+        }
+        None
+    }
+
+    /// Convert image coordinates to screen coordinates
+    fn image_to_screen_coords(&self, img_pos: (f32, f32), image_rect: egui::Rect) -> egui::Pos2 {
+        let final_scale = self.base_scale * self.scale;
+        let screen_x = image_rect.min.x + img_pos.0 * final_scale;
+        let screen_y = image_rect.min.y + img_pos.1 * final_scale;
+        egui::Pos2::new(screen_x, screen_y)
+    }
+
+    /// Start a new drawing stroke
+    fn start_drawing(&mut self, img_coords: (f32, f32)) {
+        match self.current_tool {
+            DrawingTool::FreeDraw => {
+                self.active_drawing = ActiveDrawing::FreeDraw {
+                    points: vec![img_coords],
+                };
+            }
+            DrawingTool::Rectangle | DrawingTool::Line | DrawingTool::Arrow => {
+                self.active_drawing = ActiveDrawing::Shape {
+                    start_pos: img_coords,
+                };
+            }
+            DrawingTool::Text => {
+                // Text tool uses click, not drag
+            }
+        }
+    }
+
+    /// Continue an active drawing stroke
+    fn continue_drawing(&mut self, img_coords: (f32, f32)) {
+        if let ActiveDrawing::FreeDraw { points } = &mut self.active_drawing {
+            points.push(img_coords);
+        }
+        // For shapes (Rectangle, Line, Arrow), the preview is updated in rendering
+    }
+
+    /// Finish the current drawing stroke and add it to the annotation layer
+    fn finish_drawing(&mut self, img_coords: (f32, f32)) {
+        let shape = match &self.active_drawing {
+            ActiveDrawing::FreeDraw { points } if points.len() > 1 => {
+                Some(DrawingShape::FreeDraw {
+                    points: points.clone(),
+                    color: self.drawing_settings.color.to_array(),
+                    thickness: self.drawing_settings.thickness,
+                })
+            }
+            ActiveDrawing::Shape { start_pos } => match self.current_tool {
+                DrawingTool::Rectangle => Some(DrawingShape::Rectangle {
+                    start: *start_pos,
+                    end: img_coords,
+                    color: self.drawing_settings.color.to_array(),
+                    thickness: self.drawing_settings.thickness,
+                    filled: self.drawing_settings.filled,
+                }),
+                DrawingTool::Line => Some(DrawingShape::Line {
+                    start: *start_pos,
+                    end: img_coords,
+                    color: self.drawing_settings.color.to_array(),
+                    thickness: self.drawing_settings.thickness,
+                }),
+                DrawingTool::Arrow => Some(DrawingShape::Arrow {
+                    start: *start_pos,
+                    end: img_coords,
+                    color: self.drawing_settings.color.to_array(),
+                    thickness: self.drawing_settings.thickness,
+                }),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        if let Some(shape) = shape {
+            self.add_shape_to_current_layer(shape);
+        }
+
+        self.active_drawing = ActiveDrawing::None;
+    }
+
+    /// Start text input at the given position
+    fn start_text_input(&mut self, img_coords: (f32, f32)) {
+        self.active_drawing = ActiveDrawing::Text {
+            position: img_coords,
+            content: String::new(),
+        };
+    }
+
+    /// Finish text drawing and add it to the annotation layer
+    fn finish_text_drawing(&mut self) {
+        if let ActiveDrawing::Text { position, content } = &self.active_drawing {
+            if !content.is_empty() {
+                let shape = DrawingShape::Text {
+                    position: *position,
+                    content: content.clone(),
+                    color: self.drawing_settings.color.to_array(),
+                    font_size: self.drawing_settings.font_size,
+                };
+                self.add_shape_to_current_layer(shape);
+            }
+        }
+        self.active_drawing = ActiveDrawing::None;
+    }
+
+    /// Add a shape to the current image's annotation layer
+    fn add_shape_to_current_layer(&mut self, shape: DrawingShape) {
+        if let Some(path) = &self.image_path {
+            // Save current state for undo
+            let current_shapes = self
+                .annotation_layers
+                .get(path)
+                .map(|layer| layer.shapes.clone())
+                .unwrap_or_default();
+            self.undo_stack.push(current_shapes);
+
+            // Add new shape
+            self.annotation_layers
+                .entry(path.clone())
+                .or_insert_with(|| AnnotationLayer::new(path.to_string_lossy().to_string()))
+                .shapes
+                .push(shape);
+        }
+    }
+
+    /// Render all annotations for the current image
+    fn render_annotations(&self, ui: &mut egui::Ui, image_rect: egui::Rect) {
+        // Get current layer annotations
+        if let Some(path) = &self.image_path {
+            if let Some(layer) = self.annotation_layers.get(path) {
+                for shape in &layer.shapes {
+                    self.render_shape(ui, shape, image_rect);
+                }
+            }
+        }
+
+        // Render active drawing (preview)
+        self.render_active_drawing(ui, image_rect);
+    }
+
+    /// Render a single shape
+    fn render_shape(&self, ui: &mut egui::Ui, shape: &DrawingShape, image_rect: egui::Rect) {
+        let painter = ui.painter();
+
+        let stroke_color = match shape {
+            DrawingShape::FreeDraw { color, .. }
+            | DrawingShape::Rectangle { color, .. }
+            | DrawingShape::Line { color, .. }
+            | DrawingShape::Arrow { color, .. }
+            | DrawingShape::Text { color, .. } => {
+                egui::Color32::from_rgba_premultiplied(color[0], color[1], color[2], color[3])
+            }
+        };
+
+        match shape {
+            DrawingShape::FreeDraw { points, thickness, .. } => {
+                if points.len() < 2 {
+                    return;
+                }
+
+                for window in points.windows(2) {
+                    let p1 = self.image_to_screen_coords(window[0], image_rect);
+                    let p2 = self.image_to_screen_coords(window[1], image_rect);
+                    painter.line_segment([p1, p2], egui::Stroke::new(*thickness, stroke_color));
+                }
+            }
+            DrawingShape::Rectangle { start, end, thickness, filled, .. } => {
+                let p1 = self.image_to_screen_coords(*start, image_rect);
+                let p2 = self.image_to_screen_coords(*end, image_rect);
+                let rect = egui::Rect::from_two_pos(p1, p2);
+
+                if *filled {
+                    painter.rect_filled(rect, 0.0, stroke_color);
+                } else {
+                    painter.rect_stroke(
+                        rect,
+                        0.0,
+                        egui::Stroke::new(*thickness, stroke_color),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            }
+            DrawingShape::Line { start, end, thickness, .. } => {
+                let p1 = self.image_to_screen_coords(*start, image_rect);
+                let p2 = self.image_to_screen_coords(*end, image_rect);
+                painter.line_segment([p1, p2], egui::Stroke::new(*thickness, stroke_color));
+            }
+            DrawingShape::Arrow { start, end, thickness, .. } => {
+                let p1 = self.image_to_screen_coords(*start, image_rect);
+                let p2 = self.image_to_screen_coords(*end, image_rect);
+
+                // Draw arrow shaft
+                painter.line_segment([p1, p2], egui::Stroke::new(*thickness, stroke_color));
+
+                // Draw arrowhead
+                let arrow_size = thickness * 3.0;
+                let direction = (p2 - p1).normalized();
+                let perpendicular = egui::vec2(-direction.y, direction.x);
+
+                let tip1 = p2 - direction * arrow_size + perpendicular * arrow_size * 0.5;
+                let tip2 = p2 - direction * arrow_size - perpendicular * arrow_size * 0.5;
+
+                painter.line_segment([p2, tip1], egui::Stroke::new(*thickness, stroke_color));
+                painter.line_segment([p2, tip2], egui::Stroke::new(*thickness, stroke_color));
+            }
+            DrawingShape::Text { position, content, font_size, .. } => {
+                let screen_pos = self.image_to_screen_coords(*position, image_rect);
+                painter.text(
+                    screen_pos,
+                    egui::Align2::LEFT_TOP,
+                    content,
+                    egui::FontId::proportional(*font_size),
+                    stroke_color,
+                );
+            }
+        }
+    }
+
+    /// Render the active drawing (preview)
+    fn render_active_drawing(&self, ui: &mut egui::Ui, image_rect: egui::Rect) {
+        let painter = ui.painter();
+        let color = self.drawing_settings.color;
+        let thickness = self.drawing_settings.thickness;
+
+        match &self.active_drawing {
+            ActiveDrawing::FreeDraw { points } => {
+                if points.len() < 2 {
+                    return;
+                }
+
+                for window in points.windows(2) {
+                    let p1 = self.image_to_screen_coords(window[0], image_rect);
+                    let p2 = self.image_to_screen_coords(window[1], image_rect);
+                    painter.line_segment([p1, p2], egui::Stroke::new(thickness, color));
+                }
+            }
+            ActiveDrawing::Shape { start_pos } => {
+                // For preview, we need to get the current pointer position
+                if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    if let Some(end_coords) = self.screen_to_image_coords(hover_pos, image_rect) {
+                        match self.current_tool {
+                            DrawingTool::Rectangle => {
+                                let p1 = self.image_to_screen_coords(*start_pos, image_rect);
+                                let p2 = self.image_to_screen_coords(end_coords, image_rect);
+                                let rect = egui::Rect::from_two_pos(p1, p2);
+
+                                if self.drawing_settings.filled {
+                                    painter.rect_filled(rect, 0.0, color);
+                                } else {
+                                    painter.rect_stroke(
+                                        rect,
+                                        0.0,
+                                        egui::Stroke::new(thickness, color),
+                                        egui::StrokeKind::Outside,
+                                    );
+                                }
+                            }
+                            DrawingTool::Line => {
+                                let p1 = self.image_to_screen_coords(*start_pos, image_rect);
+                                let p2 = self.image_to_screen_coords(end_coords, image_rect);
+                                painter.line_segment([p1, p2], egui::Stroke::new(thickness, color));
+                            }
+                            DrawingTool::Arrow => {
+                                let p1 = self.image_to_screen_coords(*start_pos, image_rect);
+                                let p2 = self.image_to_screen_coords(end_coords, image_rect);
+
+                                // Draw arrow shaft
+                                painter.line_segment([p1, p2], egui::Stroke::new(thickness, color));
+
+                                // Draw arrowhead
+                                let arrow_size = thickness * 3.0;
+                                let direction = (p2 - p1).normalized();
+                                let perpendicular = egui::vec2(-direction.y, direction.x);
+
+                                let tip1 = p2 - direction * arrow_size + perpendicular * arrow_size * 0.5;
+                                let tip2 = p2 - direction * arrow_size - perpendicular * arrow_size * 0.5;
+
+                                painter.line_segment([p2, tip1], egui::Stroke::new(thickness, color));
+                                painter.line_segment([p2, tip2], egui::Stroke::new(thickness, color));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            ActiveDrawing::Text { position, .. } => {
+                // Show a small indicator where text will be placed
+                let screen_pos = self.image_to_screen_coords(*position, image_rect);
+                painter.circle_filled(screen_pos, 3.0, color);
+            }
+            ActiveDrawing::None => {}
+        }
+    }
+
+    /// Handle undo operation
+    fn handle_undo(&mut self) {
+        if let Some(path) = &self.image_path {
+            let current_shapes = self
+                .annotation_layers
+                .get(path)
+                .map(|layer| layer.shapes.clone())
+                .unwrap_or_default();
+
+            if let Some(prev_shapes) = self.undo_stack.undo(current_shapes) {
+                self.annotation_layers
+                    .entry(path.clone())
+                    .or_insert_with(|| AnnotationLayer::new(path.to_string_lossy().to_string()))
+                    .shapes = prev_shapes;
+            }
+        }
+    }
+
+    /// Handle redo operation
+    fn handle_redo(&mut self) {
+        if let Some(path) = &self.image_path {
+            let current_shapes = self
+                .annotation_layers
+                .get(path)
+                .map(|layer| layer.shapes.clone())
+                .unwrap_or_default();
+
+            if let Some(next_shapes) = self.undo_stack.redo(current_shapes) {
+                self.annotation_layers
+                    .entry(path.clone())
+                    .or_insert_with(|| AnnotationLayer::new(path.to_string_lossy().to_string()))
+                    .shapes = next_shapes;
+            }
+        }
+    }
+
+    /// Clear all annotations for the current image
+    fn clear_current_annotations(&mut self) {
+        if let Some(path) = &self.image_path {
+            if let Some(layer) = self.annotation_layers.get_mut(path) {
+                // Save for undo
+                self.undo_stack.push(layer.shapes.clone());
+                layer.shapes.clear();
+            }
+        }
+    }
+
+    /// Save annotations to a JSON file
+    fn save_annotations(&self) {
+        if let Some(path) = &self.image_path {
+            if let Some(layer) = self.annotation_layers.get(path) {
+                let annotation_path = path.with_extension("annotations.json");
+
+                match serde_json::to_string_pretty(layer) {
+                    Ok(json) => {
+                        if let Err(e) = std::fs::write(&annotation_path, json) {
+                            error!("Failed to save annotations: {}", e);
+                        } else {
+                            info!("Saved annotations to {:?}", annotation_path);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize annotations: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Load annotations from a JSON file
+    fn load_annotations(&mut self) {
+        if let Some(path) = &self.image_path {
+            let annotation_path = path.with_extension("annotations.json");
+
+            if annotation_path.exists() {
+                match std::fs::read_to_string(&annotation_path) {
+                    Ok(json) => {
+                        match serde_json::from_str::<AnnotationLayer>(&json) {
+                            Ok(layer) => {
+                                self.annotation_layers.insert(path.clone(), layer);
+                                self.undo_stack.clear(); // Clear undo stack when loading
+                                info!("Loaded annotations from {:?}", annotation_path);
+                            }
+                            Err(e) => {
+                                error!("Failed to parse annotation file: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to read annotation file: {}", e);
+                    }
+                }
+            } else {
+                info!("No annotation file found at {:?}", annotation_path);
+            }
+        }
+    }
+
+    /// Export image with annotations baked in
+    fn export_image_with_annotations(&self) {
+        if let Some(img) = &self.image {
+            // Create a file dialog to save the image
+            let save_dialog = rfd::FileDialog::new()
+                .add_filter("PNG", &["png"])
+                .add_filter("JPEG", &["jpg", "jpeg"])
+                .set_file_name("annotated_image.png");
+
+            if let Some(save_path) = save_dialog.save_file() {
+                info!("Exporting annotated image to {:?}", save_path);
+
+                // Create an RGBA image buffer from the original image
+                let mut output_img = img.to_rgba8();
+
+                // Render annotations onto the image if they exist
+                if let Some(path) = &self.image_path {
+                    if let Some(layer) = self.annotation_layers.get(path) {
+                        for shape in &layer.shapes {
+                            self.render_shape_to_image(&mut output_img, shape);
+                        }
+                    }
+                }
+
+                // Save the image
+                if let Err(e) = output_img.save(&save_path) {
+                    error!("Failed to export image: {}", e);
+                } else {
+                    info!("Exported annotated image to {:?}", save_path);
+                }
+            }
+        }
+    }
+
+    /// Render a shape onto an image buffer
+    fn render_shape_to_image(&self, img: &mut image::RgbaImage, shape: &DrawingShape) {
+        use imageproc::drawing::*;
+        use image::Rgba;
+
+        let color = match shape {
+            DrawingShape::FreeDraw { color, .. }
+            | DrawingShape::Rectangle { color, .. }
+            | DrawingShape::Line { color, .. }
+            | DrawingShape::Arrow { color, .. }
+            | DrawingShape::Text { color, .. } => Rgba([color[0], color[1], color[2], color[3]]),
+        };
+
+        match shape {
+            DrawingShape::FreeDraw { points, .. } => {
+                if points.len() < 2 {
+                    return;
+                }
+
+                for window in points.windows(2) {
+                    let p1 = (window[0].0 as i32, window[0].1 as i32);
+                    let p2 = (window[1].0 as i32, window[1].1 as i32);
+                    draw_line_segment_mut(img, (p1.0 as f32, p1.1 as f32), (p2.0 as f32, p2.1 as f32), color);
+                }
+            }
+            DrawingShape::Rectangle { start, end, filled, .. } => {
+                let x1 = start.0.min(end.0) as i32;
+                let y1 = start.1.min(end.1) as i32;
+                let x2 = start.0.max(end.0) as i32;
+                let y2 = start.1.max(end.1) as i32;
+
+                if *filled {
+                    draw_filled_rect_mut(
+                        img,
+                        imageproc::rect::Rect::at(x1, y1).of_size((x2 - x1) as u32, (y2 - y1) as u32),
+                        color,
+                    );
+                } else {
+                    draw_hollow_rect_mut(
+                        img,
+                        imageproc::rect::Rect::at(x1, y1).of_size((x2 - x1) as u32, (y2 - y1) as u32),
+                        color,
+                    );
+                }
+            }
+            DrawingShape::Line { start, end, .. } => {
+                draw_line_segment_mut(
+                    img,
+                    (start.0 as f32, start.1 as f32),
+                    (end.0 as f32, end.1 as f32),
+                    color,
+                );
+            }
+            DrawingShape::Arrow { start, end, thickness, .. } => {
+                // Draw arrow shaft
+                draw_line_segment_mut(
+                    img,
+                    (start.0 as f32, start.1 as f32),
+                    (end.0 as f32, end.1 as f32),
+                    color,
+                );
+
+                // Calculate arrowhead
+                let dx = end.0 - start.0;
+                let dy = end.1 - start.1;
+                let length = (dx * dx + dy * dy).sqrt();
+
+                if length > 0.0 {
+                    let arrow_size = thickness * 3.0;
+                    let ux = dx / length;
+                    let uy = dy / length;
+
+                    // Perpendicular vector
+                    let px = -uy;
+                    let py = ux;
+
+                    let tip1_x = end.0 - ux * arrow_size + px * arrow_size * 0.5;
+                    let tip1_y = end.1 - uy * arrow_size + py * arrow_size * 0.5;
+                    let tip2_x = end.0 - ux * arrow_size - px * arrow_size * 0.5;
+                    let tip2_y = end.1 - uy * arrow_size - py * arrow_size * 0.5;
+
+                    draw_line_segment_mut(img, (end.0, end.1), (tip1_x, tip1_y), color);
+                    draw_line_segment_mut(img, (end.0, end.1), (tip2_x,  tip2_y), color);
+                }
+            }
+            DrawingShape::Text { position, content, font_size, .. } => {
+                // Text rendering on images is complex and requires font files
+                // For now, we'll draw a placeholder circle at the text position
+                // A full implementation would use ab_glyph to render actual text
+                draw_filled_circle_mut(img, (position.0 as i32, position.1 as i32), (*font_size / 2.0) as i32, color);
+
+                // Log a warning that text rendering is simplified
+                warn!("Text '{}' at ({}, {}) rendered as placeholder. Full text rendering requires font loading.",
+                      content, position.0, position.1);
+            }
+        }
     }
 
     fn scan_folder_images(&mut self, current_path: &PathBuf) {
@@ -243,7 +800,10 @@ impl ImageViewerApp {
         
         // Scan folder for adjacent images
         self.scan_folder_images(&path);
-        
+
+        // Auto-load annotations if they exist
+        self.load_annotations();
+
         Ok(())
     }
     
@@ -1160,6 +1720,24 @@ impl eframe::App for ImageViewerApp {
             }
         });
 
+        // Drawing mode keyboard shortcuts
+        if self.drawing_enabled {
+            ctx.input(|i| {
+                // Undo: Ctrl+Z / Cmd+Z
+                if i.modifiers.command && i.key_pressed(egui::Key::Z) && !i.modifiers.shift {
+                    self.handle_undo();
+                }
+                // Redo: Ctrl+Shift+Z / Cmd+Shift+Z
+                if i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Z) {
+                    self.handle_redo();
+                }
+                // Redo alternative: Ctrl+Y / Cmd+Y
+                if i.modifiers.command && i.key_pressed(egui::Key::Y) {
+                    self.handle_redo();
+                }
+            });
+        }
+
         // Store zoom info for use in central panel
         let mut zoom_info: Option<(egui::Pos2, f32, f32)> = None;
         if let Some(pointer_pos) = ctx.input(|i| i.pointer.hover_pos()) {
@@ -1177,15 +1755,15 @@ impl eframe::App for ImageViewerApp {
             }
         }
 
-        // Handle panning with left mouse button (only when pixel tool is off)
-        if !self.show_pixel_tool {
+        // Handle panning with left mouse button (only when pixel tool and drawing mode are off)
+        if !self.show_pixel_tool && !self.drawing_enabled {
             if ctx.input(|i| i.pointer.primary_pressed()) {
                 self.dragging = true;
             }
             if !ctx.input(|i| i.pointer.primary_down()) {
                 self.dragging = false;
             }
-            
+
             if self.dragging {
                 let delta = ctx.input(|i| i.pointer.delta());
                 self.offset += delta;
@@ -1321,9 +1899,19 @@ impl eframe::App for ImageViewerApp {
                         self.histogram_window_id = Some(histogram_id);
                     }
                 }
-                
+
                 ui.separator();
-                
+
+                // Drawing mode toggle
+                if ui.checkbox(&mut self.drawing_enabled, "Drawing Mode").changed() {
+                    if self.drawing_enabled {
+                        // Disable pixel tool when drawing is enabled
+                        self.show_pixel_tool = false;
+                    }
+                }
+
+                ui.separator();
+
                 // Show navigation hint if we have multiple images in folder
                 if self.folder_images.len() > 1 {
                     ui.label("Navigate: < > arrow keys");
@@ -1407,7 +1995,117 @@ impl eframe::App for ImageViewerApp {
                 ctx.request_repaint();
             }
         }
-        
+
+        // Right-side panel for drawing tools (only shown when drawing_enabled)
+        if self.drawing_enabled && self.image.is_some() {
+            egui::SidePanel::right("drawing_toolbar")
+                .resizable(false)
+                .default_width(200.0)
+                .show(ctx, |ui| {
+                    ui.heading("Drawing Tools");
+                    ui.separator();
+
+                    // Tool selection
+                    ui.label("Tool:");
+                    ui.radio_value(&mut self.current_tool, DrawingTool::FreeDraw, "✏️ Free Draw");
+                    ui.radio_value(&mut self.current_tool, DrawingTool::Rectangle, "▭ Rectangle");
+                    ui.radio_value(&mut self.current_tool, DrawingTool::Line, "— Line");
+                    ui.radio_value(&mut self.current_tool, DrawingTool::Arrow, "➤ Arrow");
+                    ui.radio_value(&mut self.current_tool, DrawingTool::Text, "🅰 Text");
+
+                    ui.separator();
+
+                    // Color picker
+                    ui.label("Color:");
+                    ui.color_edit_button_srgba(&mut self.drawing_settings.color);
+
+                    ui.separator();
+
+                    // Thickness slider
+                    ui.label("Thickness:");
+                    ui.add(egui::Slider::new(&mut self.drawing_settings.thickness, 1.0..=20.0));
+
+                    ui.separator();
+
+                    // Fill option (only for rectangle)
+                    if self.current_tool == DrawingTool::Rectangle {
+                        ui.checkbox(&mut self.drawing_settings.filled, "Filled");
+                        ui.separator();
+                    }
+
+                    // Font size (only for text)
+                    if self.current_tool == DrawingTool::Text {
+                        ui.label("Font Size:");
+                        ui.add(egui::Slider::new(&mut self.drawing_settings.font_size, 8.0..=72.0));
+                        ui.separator();
+                    }
+
+                    // Text input for active text drawing
+                    let mut should_finish_text = false;
+                    let mut should_cancel_text = false;
+
+                    if let ActiveDrawing::Text { content, .. } = &mut self.active_drawing {
+                        ui.separator();
+                        ui.label("Text Input:");
+                        let response = ui.text_edit_singleline(content);
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Place Text").clicked() || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                                if !content.is_empty() {
+                                    should_finish_text = true;
+                                }
+                            }
+
+                            if ui.button("Cancel").clicked() {
+                                should_cancel_text = true;
+                            }
+                        });
+                        ui.separator();
+                    }
+
+                    if should_finish_text {
+                        self.finish_text_drawing();
+                    }
+                    if should_cancel_text {
+                        self.active_drawing = ActiveDrawing::None;
+                    }
+
+                    // Undo/Redo buttons
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(self.undo_stack.can_undo(), egui::Button::new("↶ Undo")).clicked() {
+                            self.handle_undo();
+                        }
+                        if ui.add_enabled(self.undo_stack.can_redo(), egui::Button::new("↷ Redo")).clicked() {
+                            self.handle_redo();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Clear all drawings
+                    if ui.button("🗑 Clear All").clicked() {
+                        self.clear_current_annotations();
+                    }
+
+                    ui.separator();
+
+                    // Save/Load annotations
+                    if ui.button("💾 Save Annotations").clicked() {
+                        self.save_annotations();
+                    }
+                    if ui.button("📂 Load Annotations").clicked() {
+                        self.load_annotations();
+                    }
+
+                    ui.separator();
+
+                    // Export with drawings
+                    if ui.button("📤 Export Image").clicked() {
+                        self.export_image_with_annotations();
+                    }
+                });
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(img) = &self.image {
                 if let Some(texture) = &self.texture {
@@ -1533,7 +2231,40 @@ impl eframe::App for ImageViewerApp {
                             .fit_to_exact_size(display_size);
                         ui.put(image_rect, image);
                     }
-                    
+
+                    // Handle drawing interactions (only when drawing mode is enabled)
+                    if self.drawing_enabled {
+                        let response = ui.interact(image_rect, egui::Id::new("drawing_canvas"),
+                                                   egui::Sense::click_and_drag());
+
+                        if let Some(pointer_pos) = response.hover_pos() {
+                            if let Some(img_coords) = self.screen_to_image_coords(pointer_pos, image_rect) {
+                                // Handle mouse press (start drawing)
+                                if response.drag_started() {
+                                    self.start_drawing(img_coords);
+                                }
+
+                                // Handle mouse drag (continue drawing)
+                                if response.dragged() {
+                                    self.continue_drawing(img_coords);
+                                }
+
+                                // Handle mouse release (finish drawing)
+                                if response.drag_stopped() {
+                                    self.finish_drawing(img_coords);
+                                }
+
+                                // Handle click for text tool
+                                if self.current_tool == DrawingTool::Text && response.clicked() {
+                                    self.start_text_input(img_coords);
+                                }
+                            }
+                        }
+
+                        // Render annotations on top of image
+                        self.render_annotations(ui, image_rect);
+                    }
+
                     // Display hover information near cursor (after image to render on top)
                     if let Some(hover_pos) = self.hover_pos {
                         let text_pos = egui::pos2(hover_pos.x + 2.0, hover_pos.y - 20.0);
